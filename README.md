@@ -127,8 +127,8 @@ The full paper settings are built into the runner. Its output is saved in
 Section 6 outputs. The experiment runner is invoked separately from the
 upstream package regression suite in `test/runtests.jl`.
 
-The test environment requires Julia 1.11 or later. Run the package regression
-suite, including QTCF block acceptance and evaluation checks, with:
+The test environment requires Julia 1.11 or later. Run the upstream package
+regression suite with:
 
 ```sh
 julia --project=test test/runtests.jl
