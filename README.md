@@ -72,10 +72,12 @@ Array evaluation preserves the input shape. Output and scratch arrays must
 have matching axes; scratch arrays must not overlap. `set_eval_method`
 controls QTCF's default scalar and array evaluator. The derivative recovery
 reuses one denominator reciprocal for the value and all requested orders.
-Backward value and derivative recurrences use power-of-two rescaling to
-control their common magnitude without additional divisions. A zero
-OneDiv denominator triggers Classic evaluation; this is not an
-attainability check. Pole extraction returns roots of the unreduced
+Evaluation has no per-step normalization. As in TCF, scalar OneDiv
+evaluation rescales an intermediate numerator/denominator pair only when
+the shared underflow guard triggers, and derivative evaluation applies
+the corresponding derivative safeguard. Array OneDiv evaluation and
+the numerator/denominator derivatives used for residues are unscaled.
+A zero OneDiv denominator triggers Classic evaluation; this is not an attainability check. Pole extraction returns roots of the unreduced
 denominator. Partial-fraction conversion assumes simple poles and rejects
 exactly repeated computed poles; the contour residue fallback returns only
 the residue at a multiple pole, not its full principal part.

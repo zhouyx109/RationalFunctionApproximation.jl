@@ -145,7 +145,8 @@ end
 function _qtcf_eval_b(b, pair, z)
     length(b) == 1 && return only(b)
     if pair !== nothing && length(b) == 2
-        midpoint = _qtcf_ldexp(pair[1], -1) + _qtcf_ldexp(pair[2], -1)
+        half = oftype(float(real(pair[1])), 0.5)
+        midpoint = half * pair[1] + half * pair[2]
         midpoint_value = b[1] + b[2] * midpoint
         return midpoint_value + b[2] * (z - midpoint)
     end
@@ -200,50 +201,42 @@ function _pderiv(p)
     return [k * p[k+1] for k in 1:length(p)-1]
 end
 
-_qtcf_component_abs(x::Real) = abs(x)
-_qtcf_component_abs(x::Complex) = max(abs(real(x)), abs(imag(x)))
-_qtcf_ldexp(x::Real, exponent::Integer) = ldexp(x, exponent)
-_qtcf_ldexp(x::Complex, exponent::Integer) =
-    complex(ldexp(real(x), exponent), ldexp(imag(x), exponent))
-
-function _qtcf_normalize_pair(numer, denom)
-    scale = max(_qtcf_component_abs(numer), _qtcf_component_abs(denom))
-    if isfinite(scale) && scale > 0
-        shift = -exponent(scale)
-        return _qtcf_ldexp(numer, shift), _qtcf_ldexp(denom, shift)
-    end
-    return numer, denom
-end
-
-function _evaluate_numden(g::QuadraticThiele, z::Number)
-    @assert isfinite(z)
-    m = length(g.bpolys)
-    if m == 0
-        return _peval(g.P, z), _peval(g.Q, z)
-    end
-    S = promote_type(eltype(g.P), eltype(g.Q), typeof(z))
-    pairm = m <= length(g.pairs) ? g.pairs[m] : nothing
-    infinite = _qtcf_infinite_block(g.bpolys[m])
-    numer = infinite ? one(S) : S(_qtcf_eval_b(g.bpolys[m], pairm, z))
-    denom = infinite ? zero(S) : one(S)
-    numer, denom = _qtcf_normalize_pair(numer, denom)
-    @inbounds for k in (m-1):-1:1
-        pair = k <= length(g.pairs) ? g.pairs[k] : nothing
-        b = _qtcf_eval_b(g.bpolys[k], pair, z)
-        a = _qtcf_eval_a(g.apolys[k], pair, z)
-        scale = max(_qtcf_component_abs(a), _qtcf_component_abs(b))
-        if isfinite(scale) && scale > floatmax(typeof(scale)) * 0.125
-            numer = _qtcf_ldexp(numer, -3)
-            denom = _qtcf_ldexp(denom, -3)
+function _qtcf_backward_numden(z, bpolys, apolys, pairs, ::Type{S};
+    underflow_guard=false) where {S}
+    m = length(bpolys)
+    pair = m <= length(pairs) ? pairs[m] : nothing
+    infinite = _qtcf_infinite_block(bpolys[m])
+    A = infinite ? one(S) : S(_qtcf_eval_b(bpolys[m], pair, z))
+    m == 1 && return A, infinite ? zero(S) : one(S)
+    pair = m - 1 <= length(pairs) ? pairs[m-1] : nothing
+    B = infinite ? zero(S) : S(_qtcf_eval_a(apolys[m-1], pair, z))
+    @inbounds for k in m-1:-1:2
+        pair = k <= length(pairs) ? pairs[k] : nothing
+        previous_pair = k - 1 <= length(pairs) ? pairs[k-1] : nothing
+        if _qtcf_infinite_block(bpolys[k])
+            B = zero(S)
+        else
+            t = _qtcf_eval_b(bpolys[k], pair, z) * A + B
+            B = A * _qtcf_eval_a(apolys[k-1], previous_pair, z)
+            A = t
         end
-        numer, denom = _qtcf_infinite_block(g.bpolys[k]) ?
-            (numer, zero(S)) : (b * numer + a * denom, numer)
-        numer, denom = _qtcf_normalize_pair(numer, denom)
+        if underflow_guard && guard(A)
+            A *= 1e100
+            B *= 1e100
+        end
     end
-    return numer, denom
+    _qtcf_infinite_block(bpolys[1]) && return A, zero(S)
+    pair = isempty(pairs) ? nothing : pairs[1]
+    return _qtcf_eval_b(bpolys[1], pair, z) * A + B, A
 end
 
-
+function _evaluate_numden(g::QuadraticThiele, z::Number; underflow_guard=true)
+    @assert isfinite(z)
+    isempty(g.bpolys) && return _peval(g.P, z), _peval(g.Q, z)
+    S = promote_type(eltype(g.P), eltype(g.Q), typeof(z))
+    return _qtcf_backward_numden(z, g.bpolys, g.apolys, g.pairs, S;
+        underflow_guard)
+end
 
 function _evaluate_classic(g::QuadraticThiele, z::Number)
     isempty(g.bpolys) && return _qtcf_ratio(_peval(g.P, z), _peval(g.Q, z))
@@ -316,7 +309,7 @@ function evaluate!(t::AbstractArray, g::QuadraticThiele,
     else
         for i in eachindex(a, b, source)
             if isfinite(source[i])
-                a[i], b[i] = _evaluate_numden(g, source[i])
+                a[i], b[i] = _evaluate_numden(g, source[i]; underflow_guard=false)
             else
                 a[i] = evaluate(g, source[i], method)
                 b[i] = one(eltype(b))
@@ -378,23 +371,16 @@ function _qtcf_a_derivatives(a, pair, z, order)
     return jet
 end
 
-function _qtcf_shift_jets!(numer, denom, shift)
-    for jet in (numer, denom), k in eachindex(jet)
-        jet[k] = _qtcf_ldexp(jet[k], shift)
+function _qtcf_jet_product(left, right, degree, order)
+    out = zeros(promote_type(eltype(left), eltype(right)), order + 1)
+    for q in 0:order, j in 0:min(q, degree)
+        out[q+1] += binomial(q, j) * left[j+1] * right[q-j+1]
     end
-    return numer, denom
+    return out
 end
 
-function _qtcf_normalize_jets!(numer, denom)
-    scale = max(maximum(_qtcf_component_abs, numer; init=0),
-        maximum(_qtcf_component_abs, denom; init=0))
-    if isfinite(scale) && scale > 0
-        _qtcf_shift_jets!(numer, denom, -exponent(scale))
-    end
-    return numer, denom
-end
-
-function _qtcf_numden_derivatives(g::QuadraticThiele, z::Number, order::Integer)
+function _qtcf_numden_derivatives(g::QuadraticThiele, z::Number, order::Integer;
+    underflow_guard=true)
     S = promote_type(ComplexF64, eltype(g.P), eltype(g.Q), typeof(z))
     m = length(g.bpolys)
     if m == 0 || any(_qtcf_infinite_block, g.bpolys)
@@ -402,43 +388,37 @@ function _qtcf_numden_derivatives(g::QuadraticThiele, z::Number, order::Integer)
         denom = zeros(S, order + 1)
         p, q = S.(g.P), S.(g.Q)
         for k in 0:order
-            numer[k + 1] = _peval(p, z)
-            denom[k + 1] = _peval(q, z)
+            numer[k+1] = _peval(p, z)
+            denom[k+1] = _peval(q, z)
             p, q = _pderiv(p), _pderiv(q)
         end
         return numer, denom
     end
-
-    pairm = m <= length(g.pairs) ? g.pairs[m] : nothing
-    numer = _qtcf_b_derivatives(g.bpolys[m], pairm, z, order)
-    denom = zeros(S, order + 1)
-    denom[1] = one(S)
-    _qtcf_normalize_jets!(numer, denom)
-
-    for k in (m - 1):-1:1
-        pair = k <= length(g.pairs) ? g.pairs[k] : nothing
-        bjet = _qtcf_b_derivatives(g.bpolys[k], pair, z, order)
-        ajet = _qtcf_a_derivatives(g.apolys[k], pair, z, order)
-        scale = max(maximum(_qtcf_component_abs, bjet; init=0),
-            maximum(_qtcf_component_abs, ajet; init=0))
-        if isfinite(scale) && scale > 0
-            margin = 5 + 2ndigits(max(order, 1); base=2)
-            shift = min(0, exponent(floatmax(typeof(scale))) - margin - exponent(scale))
-            shift < 0 && _qtcf_shift_jets!(numer, denom, shift)
-        end
-        next_numer, next_denom = numer, denom
-        numer = zeros(S, order + 1)
-        for q in 0:order, j in 0:min(q, 2)
-            c = binomial(q, j)
-            numer[q + 1] += c * (
-                bjet[j + 1] * next_numer[q - j + 1] +
-                ajet[j + 1] * next_denom[q - j + 1])
-        end
-        denom = next_numer
-
-        _qtcf_normalize_jets!(numer, denom)
+    pair = m <= length(g.pairs) ? g.pairs[m] : nothing
+    A = _qtcf_b_derivatives(g.bpolys[m], pair, z, order)
+    if m == 1
+        B = zeros(S, order + 1)
+        B[1] = one(S)
+        return A, B
     end
-    return numer, denom
+    pair = m - 1 <= length(g.pairs) ? g.pairs[m-1] : nothing
+    B = _qtcf_a_derivatives(g.apolys[m-1], pair, z, order)
+    for k in m-1:-1:2
+        pair = k <= length(g.pairs) ? g.pairs[k] : nothing
+        previous_pair = k - 1 <= length(g.pairs) ? g.pairs[k-1] : nothing
+        bjet = _qtcf_b_derivatives(g.bpolys[k], pair, z, order)
+        ajet = _qtcf_a_derivatives(g.apolys[k-1], previous_pair, z, order)
+        next_A = _qtcf_jet_product(bjet, A, length(g.bpolys[k]) - 1, order) + B
+        B = _qtcf_jet_product(ajet, A, length(g.apolys[k-1]) - 1, order)
+        A = next_A
+        if underflow_guard && any(guard, A)
+            A .*= 1e50
+            B .*= 1e50
+        end
+    end
+    pair = isempty(g.pairs) ? nothing : g.pairs[1]
+    bjet = _qtcf_b_derivatives(g.bpolys[1], pair, z, order)
+    return _qtcf_jet_product(bjet, A, length(g.bpolys[1]) - 1, order) + B, A
 end
 
 function _qtcf_quotient_derivatives(numer, denom)
@@ -477,7 +457,7 @@ end
 
 
 function _evaluate_numden_derivs(g::QuadraticThiele, z::Number)
-    numer, denom = _qtcf_numden_derivatives(g, z, 1)
+    numer, denom = _qtcf_numden_derivatives(g, z, 1; underflow_guard=false)
     S = promote_type(eltype(g.P), eltype(g.Q), typeof(z))
     return S(numer[1]), S(denom[1]), S(numer[2]), S(denom[2])
 end
@@ -1166,64 +1146,26 @@ function _admissible_reduced_score(score, hnum, hden, residual=score)
 end
 
 function _qtcf_linearized_residual(fvals, zvals, P, Q)
-    scale = max(maximum(abs, P; init=0.0), maximum(abs, Q; init=0.0))
-    (!isfinite(scale) || iszero(scale)) && return fill(-Inf, length(zvals))
-    Ps = P ./ scale
-    Qs = Q ./ scale
     score = Vector{Float64}(undef, length(zvals))
     @inbounds for k in eachindex(zvals)
-        value = fvals[k] * _peval(Qs, zvals[k]) - _peval(Ps, zvals[k])
+        value = fvals[k] * _peval(Q, zvals[k]) - _peval(P, zvals[k])
         score[k] = isfinite(value) ? Float64(abs(value)) : -Inf
     end
     return score
 end
 
 function _qtcf_projective_value(z, bpolys, apolys, pairs)
-    m = length(bpolys)
     S = promote_type(ComplexF64, typeof(z), eltype(last(bpolys)))
-    infinite = _qtcf_infinite_block(bpolys[m])
-    numer = infinite ? one(S) : S(_qtcf_eval_b(bpolys[m], pairs[m], z))
-    denom = infinite ? zero(S) : one(S)
-    logscale = 0.0
-    @inbounds for k in (m-1):-1:1
-        b = S(_qtcf_eval_b(bpolys[k], pairs[k], z))
-        a = S(_qtcf_eval_a(apolys[k], pairs[k], z))
-        numer, denom = _qtcf_infinite_block(bpolys[k]) ?
-            (numer, zero(S)) : (b * numer + a * denom, numer)
-        scale = max(abs(numer), abs(denom))
-        (!isfinite(scale) || iszero(scale)) && return S(NaN), S(NaN), NaN
-        numer /= scale
-        denom /= scale
-        logscale += Float64(log(scale))
-    end
-    return numer, denom, logscale
+    return _qtcf_backward_numden(z, bpolys, apolys, pairs, S)
 end
 
 function _qtcf_linearized_residual(fvals, zvals, bpolys, apolys, pairs)
     isempty(bpolys) && return ones(Float64, length(zvals))
-    logscore = fill(-Inf, length(zvals))
-    valid = falses(length(zvals))
+    score = Vector{Float64}(undef, length(zvals))
     @inbounds for k in eachindex(zvals)
-        numer, denom, logscale =
-            _qtcf_projective_value(zvals[k], bpolys, apolys, pairs)
-        cross = abs(fvals[k] * denom - numer)
-        if isfinite(cross) && isfinite(logscale)
-            valid[k] = true
-            iszero(cross) || (logscore[k] = Float64(log(cross)) + logscale)
-        end
-    end
-    any(valid) || return fill(-Inf, length(zvals))
-    finite_logscore = filter(isfinite, logscore)
-    if isempty(finite_logscore)
-        score = fill(-Inf, length(zvals))
-        score[valid] .= 0.0
-        return score
-    end
-    offset = maximum(finite_logscore)
-    score = fill(-Inf, length(zvals))
-    @inbounds for k in eachindex(score)
-        valid[k] && (score[k] = isfinite(logscore[k]) ?
-            exp(logscore[k] - offset) : 0.0)
+        numer, denom = _qtcf_projective_value(zvals[k], bpolys, apolys, pairs)
+        value = fvals[k] * denom - numer
+        score[k] = isfinite(value) ? Float64(abs(value)) : -Inf
     end
     return score
 end
