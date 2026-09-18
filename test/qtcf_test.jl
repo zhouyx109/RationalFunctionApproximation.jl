@@ -54,18 +54,13 @@ abs_check = sort!(unique(vcat(
     -fine,
     fine .- one(T),
 )))
-abs_f = x -> abs(real(x))
-abs_domain = Segment{T}(-1, 1)
-abs_symmetric = RFA.Symmetric(abs_domain; reflection=x -> -conj(x))
-
-tcf_max_iter = 241
-tcf_parameters = (
+const INTERVAL_TCF_PARAMETERS = (
     tol=100eps(T), allowed=true,
-    max_iter=tcf_max_iter,
+    max_iter=241,
     refinement=3,
-    stagnation=tcf_max_iter,
+    stagnation=241,
 )
-qtcf_parameters = (
+const INTERVAL_QTCF_PARAMETERS = (
     tol=100eps(T), allowed=true,
     max_iter=150,
     refinement=4,
@@ -73,55 +68,45 @@ qtcf_parameters = (
     stagnation=170,
 )
 
-println("\nInterval case: |x| on [-1,1]")
-set_weight_method(OneDiv())
-abs_tcf = approximate(abs_f, abs_domain, TCF(); tcf_parameters...)
-set_weight_method(OneDiv())
-abs_qtcf_symmetric = approximate(
-    abs_f, abs_symmetric, QuadraticThiele(); qtcf_parameters...)
-
-imag_f = z -> abs(z)
-imag_domain = Segment(-1im, 1im)
-imag_symmetric = RFA.Symmetric(imag_domain; reflection=conj)
-imag_check = im .* abs_check
-
-println("Interval case: |z| on [-i,i]")
-set_weight_method(OneDiv())
-imag_tcf = approximate(imag_f, imag_domain, TCF(); tcf_parameters...)
-set_weight_method(OneDiv())
-imag_qtcf_symmetric = approximate(
-    imag_f, imag_symmetric, QuadraticThiele(); qtcf_parameters...)
-
-interval_results = (
-    real=(
+interval_cases = (
+    (
+        slug="real",
+        name="|x| on [-1,1]",
         title=raw"$|x|$ on $[-1,1]$",
-        f=abs_f,
+        f=x -> abs(real(x)),
+        domain=Segment{T}(-1, 1),
         points=abs_check,
-        runs=(
-            (label="TCF", result=abs_tcf),
-            (label="symmetric QTCF", result=abs_qtcf_symmetric),
-        ),
     ),
-    imaginary=(
+    (
+        slug="imaginary",
+        name="|z| on [-i,i]",
         title=raw"$|z|$ on $[-i,i]$",
-        f=imag_f,
-        points=imag_check,
-        runs=(
-            (label="TCF", result=imag_tcf),
-            (label="symmetric QTCF", result=imag_qtcf_symmetric),
-        ),
+        f=z -> abs(z),
+        domain=Segment(-1im, 1im),
+        points=im .* abs_check,
     ),
 )
 
+function run_interval_case(case)
+    println("\nInterval case: ", case.name)
+    tcf = approximate(case.f, case.domain, TCF(); INTERVAL_TCF_PARAMETERS...)
+    qtcf = approximate(case.f, symmetric(case.domain); INTERVAL_QTCF_PARAMETERS...)
+    (; case..., runs=(
+        (label="TCF", result=tcf),
+        (label="symmetric QTCF", result=qtcf),
+    ))
+end
+
+interval_results = map(run_interval_case, interval_cases)
+
 function interval_outputs()
     figure = Figure(size=(720, 340), fontsize=11)
-    panels = (interval_results.real, interval_results.imaginary)
     colors = (TCF_COLOR, QTCF_COLOR)
     labels = ("TCF", "symmetric QTCF")
 
     open(joinpath(NUMBERS, "interval_convergence.csv"), "w") do io
         println(io, "domain,method,iteration,denominator_degree,max_error,best")
-        for (column, panel) in enumerate(panels)
+        for (column, panel) in enumerate(interval_results)
             axis = Axis(figure[1, column]; yscale=log10,
                 title=LaTeXString(panel.title), xlabel="denominator degree",
                 ylabel="max error", titlesize=14)
@@ -133,9 +118,8 @@ function interval_outputs()
                 scatter!(axis, [data.degrees[data.best]], [errors[data.best]];
                     color=:transparent, strokecolor=:black,
                     strokewidth=1.8, markersize=10)
-                domain_name = column == 1 ? "real" : "imaginary"
                 for j in eachindex(errors)
-                    println(io, join((domain_name, run.label, j,
+                    println(io, join((panel.slug, run.label, j,
                         data.degrees[j], data.errors[j], j == data.best), ','))
                 end
             end
@@ -283,15 +267,14 @@ qtcf_cases = [
 
 function run_method(case, method)
     f = conj
-    selector = method === :AAA ? AAA() : method === :TCF ? TCF() : QuadraticThiele()
     start = time_ns()
     result = if method === :QTCF
-        symmetric = RFA.Symmetric(case.domain; reflection=case.reflection)
-        approximate(f, symmetric, selector; SCHWARZ_QTCF_PARAMETERS...)
+        approximate(f, symmetric(case.domain; reflection=case.reflection);
+            SCHWARZ_QTCF_PARAMETERS...)
     elseif method === :AAA
-        approximate(f, case.domain, selector; SCHWARZ_AAA_PARAMETERS...)
+        approximate(f, case.domain, AAA(); SCHWARZ_AAA_PARAMETERS...)
     else
-        approximate(f, case.domain, selector; SCHWARZ_TCF_PARAMETERS...)
+        approximate(f, case.domain, TCF(); SCHWARZ_TCF_PARAMETERS...)
     end
     elapsed = (time_ns() - start) / 1e9
     rational = raw(result)

@@ -16,6 +16,13 @@ end
 
 symmetric(d; kw...) = Symmetric(d; kw...)
 
+function symmetric(s::Segment; kw...)
+    haskey(kw, :reflection) && return invoke(symmetric, Tuple{Any}, s; kw...)
+    midpoint = point(s, 1//2)
+    return invoke(symmetric, Tuple{Any}, s;
+        reflection=z -> midpoint - (z - midpoint), kw...)
+end
+
 
 
 

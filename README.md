@@ -27,6 +27,21 @@ status(r)
 isconverged(r)
 ```
 
+`symmetric(s::Segment)` automatically pairs points by reflection about the
+segment's midpoint: `z -> 2c - z`, where `c` is the midpoint. This pairs
+`x` with `-x` on `Segment(-1, 1)` and `im*x` with `-im*x` on
+`Segment(-1im, 1im)`:
+
+```julia
+r = approximate(abs, symmetric(Segment(-1, 1)); stagnation=200, max_degree=200)
+```
+
+An explicit `reflection` keyword takes precedence, including
+`reflection=nothing` to retain unconstrained greedy pairing. Other domain
+types and the `Symmetric` constructor retain their existing defaults.
+This default chooses the point pairing; partner values are evaluated from
+the target function unless `value_reflection` is supplied to `approximate`.
+
 As in TCF, `allowed=true` skips pole checks, and `allowed=p -> ...`
 supplies a pole predicate. With `allowed=:strict`, poles must be off a
 curve or outside a region, depending on the domain passed in. QTCF checks
@@ -128,6 +143,11 @@ The full paper settings are built into the runner. Its output is saved in
 `test/qtcf_output/numbers/` (ten CSV data files). Rerunning replaces these
 Section 6 outputs. The experiment runner is invoked separately from the
 upstream package regression suite in `test/runtests.jl`.
+
+Every QTCF experiment uses `approximate(f, symmetric(domain); ...)`.
+The interval cases use the automatic `Segment` reflection; the eight
+Schwarz curves supply their prescribed point reflections explicitly.
+Partner values are evaluated directly from each target function.
 
 The test environment requires Julia 1.11 or later. Run the upstream package
 regression suite with:
