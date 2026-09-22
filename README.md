@@ -40,7 +40,34 @@ An explicit `reflection` keyword takes precedence, including
 `reflection=nothing` to retain unconstrained greedy pairing. Other domain
 types and the `Symmetric` constructor retain their existing defaults.
 This default chooses the point pairing; partner values are evaluated from
-the target function unless `value_reflection` is supplied to `approximate`.
+the target function unless a function symmetry is supplied as well.
+
+`symmetric(f; reflection=conj)` wraps a target function and declares the
+map of its values. The function remains callable and returns the same
+values as `f`. Together, the two wrappers specify the relation
+`f(point_reflection(z)) == value_reflection(f(z))`:
+
+```julia
+r = approximate(
+    symmetric(abs),
+    symmetric(Segment(-1, 1));
+    stagnation=200, max_degree=200,
+)
+```
+
+Here the domain wrapper pairs `x` with `-x`, and the function wrapper
+conjugates values. Since `abs` is real and even, the relation holds.
+Use `symmetric(f; reflection=identity)` for equal paired values, or
+`symmetric(f; reflection=y -> -y)` for opposite paired values. Conjugating
+values does not itself choose a point pairing or imply evenness.
+
+A wrapped function requires a point reflection from a domain wrapper or
+the `reflection` keyword of `approximate`. It selects QTCF by default.
+The declared value relation is checked at sampled reflected points; this
+is a numerical check, not a proof of symmetry over the whole domain.
+Existing calls with a plain function and the three-argument
+`value_reflection=(z, y, zr) -> ...` keyword remain supported. Do not
+supply that keyword together with a wrapped function.
 
 As in TCF, `allowed=true` skips pole checks, and `allowed=p -> ...`
 supplies a pole predicate. With `allowed=:strict`, poles must be off a
@@ -144,10 +171,13 @@ The full paper settings are built into the runner. Its output is saved in
 Section 6 outputs. The experiment runner is invoked separately from the
 upstream package regression suite in `test/runtests.jl`.
 
-Every QTCF experiment uses `approximate(f, symmetric(domain); ...)`.
-The interval cases use the automatic `Segment` reflection; the eight
-Schwarz curves supply their prescribed point reflections explicitly.
-Partner values are evaluated directly from each target function.
+Every QTCF experiment wraps both its target function and its domain:
+`approximate(symmetric(f; reflection=...), symmetric(domain; reflection=...); ...)`.
+The interval cases use the default function-value conjugation and the
+automatic `Segment` midpoint reflection. For the Schwarz target `f=conj`,
+the eight curves specify the matching value map: `y -> -y` for point
+reflection `z -> -z`, `y -> -conj(y)` for `z -> -conj(z)`, and `conj` for
+point reflection `conj`.
 
 The test environment requires Julia 1.11 or later. Run the upstream package
 regression suite with:

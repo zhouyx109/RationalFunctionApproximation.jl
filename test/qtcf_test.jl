@@ -90,7 +90,8 @@ interval_cases = (
 function run_interval_case(case)
     println("\nInterval case: ", case.name)
     tcf = approximate(case.f, case.domain, TCF(); INTERVAL_TCF_PARAMETERS...)
-    qtcf = approximate(case.f, symmetric(case.domain); INTERVAL_QTCF_PARAMETERS...)
+    qtcf = approximate(symmetric(case.f), symmetric(case.domain);
+        INTERVAL_QTCF_PARAMETERS...)
     (; case..., runs=(
         (label="TCF", result=tcf),
         (label="symmetric QTCF", result=qtcf),
@@ -236,32 +237,35 @@ paper_inlet = ClosedCurve(paper_inlet_point, paper_inlet_deriv, 0, 2pi)
 
 origin = 0.0 + 0.0im
 
-function qtcf_case(slug, name, domain, reflection, formula;
+function qtcf_case(slug, name, domain, reflection, function_reflection, formula;
     audit_n=1800, curve_n=700)
-    (; slug, name, domain, reflection, formula, audit_n, curve_n)
+    (; slug, name, domain, reflection, function_reflection, formula, audit_n, curve_n)
 end
 
 qtcf_cases = [
     qtcf_case("ellipse_1_025", "ellipse (1, 1/4) Schwarz", Shapes.ellipse(1, 0.25),
-        half_turn(origin), raw"$z(t)=\cos t+\frac{i}{4}\sin t$"),
+        half_turn(origin), y -> -y, raw"$z(t)=\cos t+\frac{i}{4}\sin t$"),
     qtcf_case("ellipse_1_05", "ellipse (1, 1/2) Schwarz", Shapes.ellipse(1, 0.5),
-        half_turn(origin), raw"$z(t)=\cos t+\frac{i}{2}\sin t$"),
+        half_turn(origin), y -> -y, raw"$z(t)=\cos t+\frac{i}{2}\sin t$"),
     qtcf_case("upper_ellipse_1_05", "upper ellipse (1, 1/2) Schwarz",
         paper_upper_ellipse, line_reflection(origin, -1.0 + 0.0im),
+        y -> -conj(y),
         raw"$z(t)=\cos(\pi(1-t))+\frac{i}{2}\sin(\pi(1-t))$"),
     qtcf_case("five_lobed", "five-lobed Schwarz", paper_lobed_full,
         line_reflection(origin, -1.0 + 0.0im),
+        y -> -conj(y),
         raw"$z(t)=(1+0.2\sin 5t)e^{it}$"),
     qtcf_case("smooth_s", "smooth letter S Schwarz", paper_smooth_s_curve,
-        half_turn(origin), raw"$z(t)=-0.75\sin(2\pi t)+i(2-4t)$"),
+        half_turn(origin), y -> -y, raw"$z(t)=-0.75\sin(2\pi t)+i(2-4t)$"),
     qtcf_case("two_semicircle_s", "two-semicircle S Schwarz", paper_semicircle_s_curve,
-        half_turn(origin),
+        half_turn(origin), y -> -y,
         raw"$z(t)=i+e^{i(\pi/2+2\pi t)}\ (0\leq t\leq1/2),\quad z(t)=-i+e^{i(3\pi/2-2\pi t)}\ (1/2<t\leq1)$"),
     qtcf_case("superellipse_6", "superellipse x^6+y^6=1 Schwarz", paper_superellipse6,
-        half_turn(origin),
+        half_turn(origin), y -> -y,
         raw"$z(t)=\mathrm{sgn}(\cos t)|\cos t|^{1/3}+i\mathrm{sgn}(\sin t)|\sin t|^{1/3}$"),
     qtcf_case("analytic_inlet", "analytic right inlet Schwarz", paper_inlet,
         line_reflection(origin, 1.0 + 0.0im),
+        conj,
         raw"$z(t)=0.1-0.1\cos t-0.7\cos2t-0.1\cos3t-i(0.8\sin t+0.4\sin2t+0.2\sin3t)$"),
 ]
 
@@ -269,7 +273,8 @@ function run_method(case, method)
     f = conj
     start = time_ns()
     result = if method === :QTCF
-        approximate(f, symmetric(case.domain; reflection=case.reflection);
+        approximate(symmetric(f; reflection=case.function_reflection),
+            symmetric(case.domain; reflection=case.reflection);
             SCHWARZ_QTCF_PARAMETERS...)
     elseif method === :AAA
         approximate(f, case.domain, AAA(); SCHWARZ_AAA_PARAMETERS...)

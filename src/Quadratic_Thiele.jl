@@ -16,6 +16,10 @@ end
 
 symmetric(d; kw...) = Symmetric(d; kw...)
 
+symmetric(f::Function; reflection::Function=conj) = Symmetric(f; reflection)
+
+(f::Symmetric{<:Function})(x) = f.domain(x)
+
 function symmetric(s::Segment; kw...)
     haskey(kw, :reflection) && return invoke(symmetric, Tuple{Any}, s; kw...)
     midpoint = point(s, 1//2)
@@ -2000,7 +2004,7 @@ function approximate(
         sprobe = path.params[I]
         zprobe = S(_param_point(d, sprobe))
         zrprobe = S(reflection(zprobe))
-        _same(zprobe, zrprobe) && continue
+        _same(zprobe, zrprobe) && value_reflection === nothing && continue
         yprobe = S(f(zprobe))
         yrprobe = S(f(zrprobe))
         if value_reflection !== nothing
@@ -2009,6 +2013,7 @@ function approximate(
                 "value_reflection does not match f at reflected continuum points"))
             yrprobe = ymapped
         end
+        _same(zprobe, zrprobe) && continue
         push!(probe_values, yprobe)
         push!(reflected_probe_values, yrprobe)
         length(probe_values) == 16 && break
@@ -2197,6 +2202,45 @@ function approximate(
 
     best_g, stop = _qtcf_result(history, stop_reason, allowed, length(bpolys))
     return RFA.ContinuumApproximation(f, d, best_g, allowed, path, history, stop)
+end
+
+function approximate(f::Symmetric{<:Function}, d; kw...)
+    if haskey(kw, :method)
+        method, rest = RFA._pop_deprecated_method_kw(kw)
+        return approximate(f, d, method; rest...)
+    end
+    return approximate(f, d, QuadraticThiele(); kw...)
+end
+
+function approximate(f::Symmetric{<:Function}, d, ::QuadraticThiele;
+    reflection=nothing, kw...)
+    haskey(kw, :value_reflection) && throw(ArgumentError(
+        "Supply the value reflection through symmetric(f; reflection=...), not also value_reflection"))
+    f.reflection isa Function || throw(ArgumentError(
+        "A symmetric function requires a value reflection map"))
+    if d isa Symmetric
+        reflection === nothing || throw(ArgumentError(
+            "Supply the point reflection through symmetric(domain; reflection=...), not also approximate"))
+        reflection = d.reflection
+        d = d.domain
+    end
+    reflection isa Function || throw(ArgumentError(
+        "A symmetric function requires a point reflection; use symmetric(domain; reflection=...) or the reflection keyword"))
+    value_reflection = (z, y, zr) -> f.reflection(y)
+    if d isa AbstractVector
+        y = f.domain.(d)
+        for (z, value) in zip(d, y)
+            isapprox(f.reflection(value), f.domain(reflection(z));
+                rtol=1e-10, atol=1e-12) || throw(ArgumentError(
+                "The function reflection does not match f at reflected sample points"))
+        end
+        return approximate(y, d, QuadraticThiele(); reflection, value_reflection, kw...)
+    end
+    return approximate(f.domain, d, QuadraticThiele(); reflection, value_reflection, kw...)
+end
+
+function approximate(f::Symmetric{<:Function}, d, method::RFA.AbstractRationalFunction; kw...)
+    throw(ArgumentError("Symmetric dispatch requires QuadraticThiele/QTCF"))
 end
 
 function approximate(f::Function, d::Symmetric; kw...)
