@@ -1,6 +1,6 @@
 # Algorithms
 
-There are three algorithms for rational approximation offered in this version of the package:
+There are four algorithms for rational approximation offered in this version of the package:
 
 AAA
 : Adaptive iteration based on the barycentric representation of rational functions [NakatsukasaAAAAlgorithm2018](@cite), [DriscollAAARational2024](@cite). 
@@ -8,10 +8,13 @@ AAA
 Thiele continued fractions
 : Adaptive iteration based on the Thiele continued fraction representation of rational functions [SalazarCelisNumericalContinued2024](@cite).
 
+Quadratic Thiele continued fractions
+: One- or two-point continued-fraction updates, with optional point and value symmetry. See [Quadratic Thiele continued fractions](@ref).
+
 Partial fractions with prescribed poles
 : Linear least-squares approximation with user-specified poles [CostaAAAleastSquares2023](@cite).
 
-The first two algorithms are nonlinear but capable of high accuracy with automatic selection of poles. The third algorithm is linear and fast, but achieving high accuracy depends on the singularity structure and the quality of information known about it.
+The first three algorithms are nonlinear but capable of high accuracy with automatic selection of poles. The prescribed-pole algorithm is linear and fast, but achieving high accuracy depends on the singularity structure and the quality of information known about it.
 
 Each algorithm has a **discrete** variant, which approximates values given on a point set, and a **continuum** variant, which approximates a function defined on a piecewise-smooth domain in the complex plane. The continuum variants are generally more robust and accurate when there are singularities near the domain of approximation.
 

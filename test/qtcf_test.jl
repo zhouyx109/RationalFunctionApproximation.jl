@@ -1,470 +1,232 @@
 using RationalFunctionApproximation, ComplexRegions, CairoMakie, LaTeXStrings
-using Logging, Printf
+using Logging, Printf, LinearAlgebra
 
-const RFA = RationalFunctionApproximation
 isdefined(RFA, :QuadraticThiele) || error(
     "These experiments require the local QTCF extension. Run this file with --project=test from this checkout.")
 
-const ROOT = @__DIR__
+const EXPERIMENT_MODE = isdefined(@__MODULE__, :QTCF_EXPERIMENT_MODE) ?
+    QTCF_EXPERIMENT_MODE : :continuum
+EXPERIMENT_MODE in (:continuum, :discrete) || error("Unknown experiment mode: $EXPERIMENT_MODE")
 
-const OUTPUT = joinpath(ROOT, "qtcf_output")
-const FIGURES = joinpath(OUTPUT, "figures")
-const NUMBERS = joinpath(OUTPUT, "numbers")
-mkpath.((FIGURES, NUMBERS))
+include("qtcf_parameters.jl")
+include("qtcf_output.jl")
 
-const T = Float64
-const DEFAULT_TOL = 1e-12
-const AAA_COLOR = RGBf(0 / 255, 114 / 255, 178 / 255)
-const TCF_COLOR = RGBf(230 / 255, 159 / 255, 0 / 255)
-const QTCF_COLOR = RGBf(0 / 255, 158 / 255, 115 / 255)
-
-global_logger(ConsoleLogger(stderr, Logging.Error))
+# Recurrence selectors must be defined before the numerical calls are compiled.
 set_eval_method(OneDiv())
 set_weight_method(OneDiv())
 
-function save_figure(name, figure)
-    save(joinpath(FIGURES, name * ".pdf"), figure)
-    save(joinpath(FIGURES, name * ".png"), figure; px_per_unit=2)
-end
-
-println("RationalFunctionApproximation ", pkgversion(RFA))
-println("Package source: ", pathof(RFA))
-println("Running all Section 6 experiments with full paper settings.")
-println("Output: ", OUTPUT)
-
-function history_data(result, f, points)
-    target = f.(points)
-    approximants = getproperty.(result.history, :interpolant)
-    denominator_degrees = [degrees(approximant)[2] for approximant in approximants]
-    errors = Float64[]
-    for approximant in approximants
-        pointwise = abs.(target .- approximant.(points))
-        push!(errors, all(isfinite, pointwise) ? maximum(pointwise) : Inf)
+# Fixed discrete grids share all continuum supports and reflected samples.
+function support_parameters(domain, result)
+    mesh_s, mesh_z = collect(result.path, :nodes)
+    map(nodes(get_function(result))) do z
+        distance, k = findmin(abs.(mesh_z .- z))
+        s = T(mesh_s[k])
+        # Near a nonsmooth parametrization, parameter roundoff can exceed _same.
+        h = 4eps(T) * max(one(T), abs(s))
+        bound = maximum(abs(point(domain, RFA._clean_param(domain, s + δ)) - mesh_z[k])
+            for δ in (-h, h))
+        if !RFA._same(mesh_z[k], z) && distance > bound
+            s = RFA._reflection_param(domain, zero(T), _ -> z)
+        end
+        s / length(domain)
     end
-    candidates = findall(isfinite, errors)
-    isempty(candidates) && error("No finite interval approximation was found.")
-    best = candidates[argmin(errors[candidates])]
-    (; degrees=denominator_degrees, errors, best)
 end
 
-fine = T(2) .^ (-100:0.1:-1)
-abs_check = sort!(unique(vcat(
-    range(-one(T), one(T), 10001),
-    fine,
-    -fine,
-    fine .- one(T),
-)))
-const INTERVAL_TCF_PARAMETERS = (
-    tol=100eps(T), allowed=true,
-    max_iter=241,
-    refinement=3,
-    stagnation=241,
-)
-const INTERVAL_QTCF_PARAMETERS = (
-    tol=100eps(T), allowed=true,
-    max_iter=150,
-    refinement=4,
-    initial_refinement=28,
-    stagnation=170,
-)
-
-interval_cases = (
-    (
-        slug="real",
-        name="|x| on [-1,1]",
-        title=raw"$|x|$ on $[-1,1]$",
-        f=x -> abs(real(x)),
-        domain=Segment{T}(-1, 1),
-        points=abs_check,
-    ),
-    (
-        slug="imaginary",
-        name="|z| on [-i,i]",
-        title=raw"$|z|$ on $[-i,i]$",
-        f=z -> abs(z),
-        domain=Segment(-1im, 1im),
-        points=im .* abs_check,
-    ),
-)
-
-function run_interval_case(case)
-    println("\nInterval case: ", case.name)
-    tcf = approximate(case.f, case.domain, TCF(); INTERVAL_TCF_PARAMETERS...)
-    qtcf = approximate(symmetric(case.f), symmetric(case.domain);
-        INTERVAL_QTCF_PARAMETERS...)
-    (; case..., runs=(
-        (label="TCF", result=tcf),
-        (label="symmetric QTCF", result=qtcf),
-    ))
+function discrete_grid_samples(domain, seeds)
+    closed = RFA.isclosed(domain)
+    clean(s) = closed ? mod(s, one(T)) : clamp(s, zero(T), one(T))
+    mapped(s) = point(domain, length(domain) * clean(s))
+    Z = typeof(mapped(zero(T)))
+    support = Z[z for result in seeds for z in nodes(get_function(result))]
+    parameters = unique(vcat(support_parameters.(Ref(domain), seeds)...))
+    # Match the stable-evaluation grid: uniform points, nodes, and log neighbors.
+    uniform = mapped.(range(zero(T); step=one(T)/DISCRETE_UNIFORM_N,
+        length=DISCRETE_UNIFORM_N))
+    neighbors = Z[mapped(s + sign * 10.0^exponent)
+        for s in parameters for exponent in DISCRETE_LOG_EXPONENTS for sign in (-1, 1)]
+    (; support, parameters, uniform, neighbors)
 end
 
-interval_results = map(run_interval_case, interval_cases)
+function shared_discrete_grid(domain, reflection, seeds;
+    samples=discrete_grid_samples(domain, seeds),
+    source="uniform+continuum_support_union+parameter_log_neighbors+exact_reflection_closure")
+    (; support, parameters, uniform, neighbors) = samples
+    # Signed zeros denote the same coordinate, not two distinct samples.
+    cleanzero(x) = iszero(x) ? zero(x) : x
+    coordinate(z) = z isa Real ? cleanzero(z) :
+        complex(cleanzero(real(z)), cleanzero(imag(z)))
+    points = unique(coordinate.(vcat(support, uniform, neighbors)))
+    Z = eltype(points)
+    base_count = length(points)
 
-function interval_outputs()
-    figure = Figure(size=(720, 340), fontsize=11)
-    colors = (TCF_COLOR, QTCF_COLOR)
-    labels = ("TCF", "symmetric QTCF")
+    # Retain every distinct log sample and add each exact reflected coordinate.
+    exact = Set(points)
+    i = 1
+    while i <= length(points)
+        zr = coordinate(Z(reflection(points[i])))
+        if zr ∉ exact
+            push!(points, zr)
+            push!(exact, zr)
+        end
+        i += 1
+    end
+    reflection_closed = all(z -> coordinate(Z(reflection(z))) in exact, points)
+    reflection_closed || error("The shared fitting grid is not closed under reflection")
+    println("  shared fixed grid: ", base_count, " base points, ", length(points),
+        " after exact reflection closure (", length(unique(coordinate.(support))), " continuum support points)")
+    (; points, exact, closed=RFA.isclosed(domain), source, base_count,
+        reflection_closed, uniform_count=length(unique(coordinate.(uniform))),
+        support_count=length(unique(coordinate.(support))), support_parameter_count=length(parameters),
+        neighbor_count=length(unique(coordinate.(neighbors))),
+        seed_node_counts=length.(nodes.(get_function.(seeds))))
+end
 
-    open(joinpath(NUMBERS, "interval_convergence.csv"), "w") do io
-        println(io, "domain,method,iteration,denominator_degree,max_error,best")
-        for (column, panel) in enumerate(interval_results)
-            axis = Axis(figure[1, column]; yscale=log10,
-                title=LaTeXString(panel.title), xlabel="denominator degree",
-                ylabel="max error", titlesize=14)
-            for (run, color, label) in zip(panel.runs, colors, labels)
-                data = history_data(run.result, panel.f, panel.points)
-                errors = max.(data.errors, floatmin(T))
-                scatterlines!(axis, data.degrees, errors;
-                    color, label, linewidth=1.0, markersize=2.8, alpha=0.65)
-                scatter!(axis, [data.degrees[data.best]], [errors[data.best]];
-                    color=:transparent, strokecolor=:black,
-                    strokewidth=1.8, markersize=10)
-                for j in eachindex(errors)
-                    println(io, join((panel.slug, run.label, j,
-                        data.degrees[j], data.errors[j], j == data.best), ','))
-                end
-            end
-            text!(axis, 0.96, 0.94; text=column == 1 ? "(a)" : "(b)",
-                space=:relative, align=(:right, :top), fontsize=14)
+function run_intervals(metadata)
+    interval_seeds = map(interval_cases) do case
+        println("\nInterval continuum seed: ", case.name)
+        tcf = approximate(case.f, case.domain, TCF(); INTERVAL_TCF_PARAMETERS...)
+        qtcf = approximate(symmetric(case.f), symmetric(case.domain);
+            INTERVAL_QTCF_PARAMETERS...)
+        (tcf, qtcf)
+    end
+
+    interval_grids = if EXPERIMENT_MODE === :discrete
+        samples = map((case, seeds) -> discrete_grid_samples(case.domain, seeds),
+            interval_cases, interval_seeds)
+        # Use one coordinate grid for both intervals, so rotation changes no samples.
+        common = (; (name => unique(vcat(real.(getproperty(samples[1], name)),
+            imag.(getproperty(samples[2], name)))) for name in (:support, :uniform, :neighbors))...)
+        parameters = unique(vcat(getproperty.(samples, :parameters)...))
+        map(eachindex(interval_cases)) do j
+            case, seeds = interval_cases[j], interval_seeds[j]
+            rotate = j == 1 ? identity : x -> im * x
+            mapped = (; (name => rotate.(getproperty(common, name))
+                for name in (:support, :uniform, :neighbors))..., parameters)
+            shared_discrete_grid(case.domain, symmetric(case.domain).reflection, seeds;
+                samples=mapped,
+                source="uniform+all_interval_continuum_support_union+parameter_log_neighbors+exact_reflection_closure")
         end
     end
 
-    legend_elements = [
-        [LineElement(color=color, linewidth=1.3),
-            MarkerElement(color=color, marker=:circle, markersize=4)]
-        for color in colors
-    ]
-    Legend(figure[2, 1:2], legend_elements, collect(labels);
-        orientation=:horizontal, framevisible=true, padding=(4, 4, 2, 2),
-        labelsize=10)
-    rowgap!(figure.layout, 2)
-    colgap!(figure.layout, 12)
-    save_figure("Figure_6_1_interval_convergence", figure)
-end
-
-interval_outputs()
-
-const SCHWARZ_AAA_PARAMETERS = (
-    tol=DEFAULT_TOL,
-    allowed=true,
-    max_iter=150,
-    refinement=4,
-    stagnation=10,
-)
-const SCHWARZ_TCF_PARAMETERS = (
-    tol=DEFAULT_TOL,
-    allowed=true,
-    max_iter=500,
-    refinement=3,
-    stagnation=10,
-)
-const SCHWARZ_QTCF_PARAMETERS = (
-    tol=DEFAULT_TOL,
-    allowed=true,
-    max_iter=100,
-    refinement=3,
-    initial_refinement=20,
-    stagnation=10,
-)
-
-raw(result) = get_function(result)
-curve_points(domain, n=800) = [point(domain, t) for t in range(0, length(domain); length=n)]
-grid_points(domain, n=1200) = RFA.isclosed(domain) ?
-    [point(domain, t) for t in range(0, length(domain); length=n + 1)[1:end-1]] :
-    [point(domain, t) for t in range(0, length(domain); length=n)]
-
-function finite_max_error(result, f, points)
-    result === nothing && return NaN
-    values = abs.(f.(points) .- result.(points))
-    any(!isfinite, values) && return Inf
-    maximum(values; init=0.0)
-end
-
-half_turn(c) = z -> 2c - z
-line_reflection(c, factor) = z -> begin
-    w = z - c
-    c + factor * complex(real(w), -imag(w))
-end
-
-upper_ellipse_point(t) = begin
-    theta = pi * (1 - t)
-    cos(theta) + 0.5im * sin(theta)
-end
-upper_ellipse_deriv(t) = begin
-    theta = pi * (1 - t)
-    pi * sin(theta) - 0.5im * pi * cos(theta)
-end
-paper_upper_ellipse = Curve(upper_ellipse_point, upper_ellipse_deriv, 0, 1)
-
-paper_lobed_full = ClosedCurve(t -> (1 + 0.2sin(5t)) * cis(t), 0, 2pi)
-
-paper_smooth_s_point(t) = -0.75sin(2pi * t) + im * (2 - 4t)
-paper_smooth_s_deriv(t) = -1.5pi * cos(2pi * t) - 4im
-paper_smooth_s_curve = Curve(paper_smooth_s_point, paper_smooth_s_deriv, 0, 1)
-
-function paper_semicircle_s_point(t)
-    if t <= 0.5
-        s = 2t
-        return im + cis(pi / 2 + pi * s)
+    map(eachindex(interval_cases)) do j
+        case = interval_cases[j]
+        tcf, qtcf = interval_seeds[j]
+        if EXPERIMENT_MODE === :discrete
+            grid = interval_grids[j]
+            reflection = symmetric(case.domain).reflection
+            println("\nDiscrete interval case: ", case.name)
+            tcf = approximate(case.f, grid.points, TCF();
+                discrete_parameters(INTERVAL_TCF_PARAMETERS)...)
+            qtcf = approximate(symmetric(case.f), symmetric(grid.points; reflection);
+                discrete_parameters(INTERVAL_QTCF_PARAMETERS)...)
+            for (k, (method, result)) in enumerate(zip((:TCF, :QTCF), (tcf, qtcf)))
+                record_discrete_run!(metadata, case.slug, method, result, grid,
+                    grid.seed_node_counts[k], length(case.points))
+            end
+        end
+        (; case..., runs=(tcf, qtcf))
     end
-    s = 2t - 1
-    -im + cis(pi / 2 - pi * s)
 end
 
-paper_semicircle_s_deriv(t) =
-    (paper_semicircle_s_point(t + 1e-6) - paper_semicircle_s_point(t - 1e-6)) / 2e-6
-paper_semicircle_s_curve =
-    Curve(paper_semicircle_s_point, paper_semicircle_s_deriv, 0, 1)
-
-signedpow(u, p) = abs(u) < 1e-14 ? 0.0 : sign(u) * abs(u)^p
-function super6_point(t)
-    signedpow(cos(t), 1 / 3) + im * signedpow(sin(t), 1 / 3)
-end
-super6_deriv(t) = (super6_point(t + 1e-6) - super6_point(t - 1e-6)) / 2e-6
-paper_superellipse6 = ClosedCurve(super6_point, super6_deriv, 0, 2pi)
-
-const inlet_a0 = 0.1
-const inlet_A = [-0.1, -0.7, -0.1]
-const inlet_B = [-0.8, -0.4, -0.2]
-
-paper_inlet_point(t) = inlet_a0 + sum(
-    inlet_A[k] * cos(k * t) + im * inlet_B[k] * sin(k * t)
-    for k in eachindex(inlet_A))
-paper_inlet_deriv(t) = sum(
-    -k * inlet_A[k] * sin(k * t) + im * k * inlet_B[k] * cos(k * t)
-    for k in eachindex(inlet_A))
-paper_inlet = ClosedCurve(paper_inlet_point, paper_inlet_deriv, 0, 2pi)
-
-origin = 0.0 + 0.0im
-
-function qtcf_case(slug, name, domain, reflection, function_reflection, formula;
-    audit_n=1800, curve_n=700)
-    (; slug, name, domain, reflection, function_reflection, formula, audit_n, curve_n)
+function curve_points(domain, n; periodic=false)
+    parameters = range(0, length(domain); length=n + periodic)
+    # Closed-curve validation counts the common endpoint only once.
+    periodic && (parameters = parameters[1:end-1])
+    return [point(domain, t) for t in parameters]
 end
 
-qtcf_cases = [
-    qtcf_case("ellipse_1_025", "ellipse (1, 1/4) Schwarz", Shapes.ellipse(1, 0.25),
-        half_turn(origin), y -> -y, raw"$z(t)=\cos t+\frac{i}{4}\sin t$"),
-    qtcf_case("ellipse_1_05", "ellipse (1, 1/2) Schwarz", Shapes.ellipse(1, 0.5),
-        half_turn(origin), y -> -y, raw"$z(t)=\cos t+\frac{i}{2}\sin t$"),
-    qtcf_case("upper_ellipse_1_05", "upper ellipse (1, 1/2) Schwarz",
-        paper_upper_ellipse, line_reflection(origin, -1.0 + 0.0im),
-        y -> -conj(y),
-        raw"$z(t)=\cos(\pi(1-t))+\frac{i}{2}\sin(\pi(1-t))$"),
-    qtcf_case("five_lobed", "five-lobed Schwarz", paper_lobed_full,
-        line_reflection(origin, -1.0 + 0.0im),
-        y -> -conj(y),
-        raw"$z(t)=(1+0.2\sin 5t)e^{it}$"),
-    qtcf_case("smooth_s", "smooth letter S Schwarz", paper_smooth_s_curve,
-        half_turn(origin), y -> -y, raw"$z(t)=-0.75\sin(2\pi t)+i(2-4t)$"),
-    qtcf_case("two_semicircle_s", "two-semicircle S Schwarz", paper_semicircle_s_curve,
-        half_turn(origin), y -> -y,
-        raw"$z(t)=i+e^{i(\pi/2+2\pi t)}\ (0\leq t\leq1/2),\quad z(t)=-i+e^{i(3\pi/2-2\pi t)}\ (1/2<t\leq1)$"),
-    qtcf_case("superellipse_6", "superellipse x^6+y^6=1 Schwarz", paper_superellipse6,
-        half_turn(origin), y -> -y,
-        raw"$z(t)=\mathrm{sgn}(\cos t)|\cos t|^{1/3}+i\mathrm{sgn}(\sin t)|\sin t|^{1/3}$"),
-    qtcf_case("analytic_inlet", "analytic right inlet Schwarz", paper_inlet,
-        line_reflection(origin, 1.0 + 0.0im),
-        conj,
-        raw"$z(t)=0.1-0.1\cos t-0.7\cos2t-0.1\cos3t-i(0.8\sin t+0.4\sin2t+0.2\sin3t)$"),
-]
-
-function run_method(case, method)
-    f = conj
-    start = time_ns()
-    result = if method === :QTCF
-        approximate(symmetric(f; reflection=case.function_reflection),
-            symmetric(case.domain; reflection=case.reflection);
-            SCHWARZ_QTCF_PARAMETERS...)
-    elseif method === :AAA
-        approximate(f, case.domain, AAA(); SCHWARZ_AAA_PARAMETERS...)
+function fit_schwarz(case, method; points=nothing)
+    fit_domain = points === nothing ? case.domain : points
+    rotation = EXPERIMENT_MODE === :continuum ? case.rotation : one(case.rotation)
+    if rotation != 1
+        # Use the same canonical coordinates for all three methods.
+        original = fit_domain
+        constructor = RFA.isclosed(original) ? ClosedCurve : Curve
+        fit_domain = constructor(t -> point(original, t) / rotation,
+            t -> ComplexRegions.tangent(original, t) / rotation, 0, 1)
+    end
+    # For Schwarz data, the value map must satisfy conj(ρ(z)) = τ(conj(z)).
+    f, domain, algorithm = if method === :QTCF
+        (symmetric(conj; reflection=rotation != 1 ? conj : case.function_reflection),
+            symmetric(fit_domain; reflection=rotation != 1 ? conj : case.reflection), QTCF())
     else
-        approximate(f, case.domain, TCF(); SCHWARZ_TCF_PARAMETERS...)
+        conj, fit_domain, method === :AAA ? AAA() : TCF()
     end
-    elapsed = (time_ns() - start) / 1e9
-    rational = raw(result)
-    pole, residue = residues(rational)
-    audit = grid_points(case.domain, case.audit_n)
-    error = finite_max_error(result, f, audit)
-    rational_degrees = degrees(rational)
-    (; result, rational, pole, residue, error, elapsed,
-        rational_degree=rational_degrees[2], rational_degrees)
+    parameters = SCHWARZ_PARAMETERS[method]
+    points === nothing || (parameters = discrete_parameters(parameters))
+    approximate(f, domain, algorithm; parameters...)
 end
 
-function run_case(case)
+function run_method(case, method, metadata; grid=nothing, seed_nodes=0)
+    start = time_ns()
+    result = fit_schwarz(case, method; points=grid === nothing ? nothing : grid.points)
+    elapsed = (time_ns() - start) / 1e9
+    rational = get_function(result)
+    pole, residue = residues(rational)
+    rotation = EXPERIMENT_MODE === :continuum ? case.rotation : one(case.rotation)
+    pole .*= rotation
+    residue .*= abs2(rotation)
+    audit = curve_points(case.domain, SCHWARZ_AUDIT_N; periodic=RFA.isclosed(case.domain))
+    error = max_error(z -> conj(rotation) * result(z / rotation), conj.(audit), audit)
+    rational_degrees = degrees(rational)
+    stop = status(result)
+    grid === nothing || record_discrete_run!(metadata, case.slug, method, result, grid,
+        seed_nodes, length(audit))
+    (; pole, residue, error, elapsed, rational_degrees, failed=false,
+        selected_nodes=length(nodes(rational)), recorded=length(result.history),
+        returned_record=stop.best, sampled_error=stop.error, stop_reason=stop.reason)
+end
+
+function run_case(case, metadata)
     println("\nSchwarz case: ", case.name)
+    grid = if EXPERIMENT_MODE === :discrete
+        seeds = map(METHODS) do method
+            println("  continuum grid seed ", method)
+            fit_schwarz(case, method)
+        end
+        shared_discrete_grid(case.domain, case.reflection, seeds)
+    end
     rows = Dict{Symbol,Any}()
-    for method in (:AAA, :TCF, :QTCF)
-        print("  continuum ", method, " ... ")
+    for (j, method) in enumerate(METHODS)
+        print("  ", EXPERIMENT_MODE, " ", method, " ... ")
         try
-            row = run_method(case, method)
-            rows[method] = merge(row, (failed=false, exception=nothing))
+            row = run_method(case, method, metadata; grid,
+                seed_nodes=grid === nothing ? 0 : grid.seed_node_counts[j])
+            rows[method] = row
             @printf("error %.3e, degree %s, %.3f s\n",
                 row.error, string(row.rational_degrees), row.elapsed)
         catch exception
             rows[method] = (
-                result=nothing, rational=nothing,
                 pole=ComplexF64[], residue=ComplexF64[],
-                error=NaN, elapsed=NaN, rational_degree=-1,
-                rational_degrees=(-1, -1), failed=true, exception=exception)
+                error=NaN, elapsed=NaN, rational_degrees=(-1, -1), failed=true,
+                selected_nodes=0, recorded=0, returned_record=0,
+                sampled_error=NaN, stop_reason=:failed)
             println("failed: ", exception)
         end
     end
-    (; case, curve=curve_points(case.domain, case.curve_n), rows)
+    (; case, curve=curve_points(case.domain, SCHWARZ_CURVE_N), rows)
 end
 
-schwarz_results = run_case.(qtcf_cases)
+function run_experiments()
+    global_logger(ConsoleLogger(stderr, Logging.Error))
+    BLAS.set_num_threads(1)
+    println("RationalFunctionApproximation ", pkgversion(RFA))
+    println("Package source: ", pathof(RFA))
+    println("Running all paper experiments.")
+    EXPERIMENT_MODE === :discrete && println(
+        "Discrete mode: one fixed shared grid per case, seeded by the continuum fits.")
+    println("Output: ", OUTPUT)
 
-const CASE_LABELS = Dict(
-    "ellipse_1_05" => "Ellipse (1, 1/2)",
-    "ellipse_1_025" => "Ellipse (1, 1/4)",
-    "upper_ellipse_1_05" => "Upper ellipse (1, 1/2)",
-    "five_lobed" => "Five-lobed curve",
-    "smooth_s" => "Smooth S",
-    "two_semicircle_s" => "Two-semicircle S",
-    "superellipse_6" => "Superellipse",
-    "analytic_inlet" => "Analytic inlet",
-)
-
-const CONTINUUM_LIMITS = (-2.25, 2.25, -2.25, 2.25)
-const CONTINUUM_TICKS = -2:1:2
-
-function write_continuum_summary()
-    open(joinpath(NUMBERS, "schwarz_summary.csv"), "w") do io
-        println(io, "case,method,max_error,degree,numerator_degree,denominator_degree,time_seconds,failed")
-        for result in schwarz_results, method in (:AAA, :TCF, :QTCF)
-            row = result.rows[method]
-            pdeg, qdeg = row.rational_degrees
-            println(io, join((result.case.slug, method, row.error,
-                row.rational_degree, pdeg, qdeg, row.elapsed, row.failed), ','))
-        end
-    end
+    metadata = NamedTuple[]
+    interval_results = run_intervals(metadata)
+    schwarz_results = [run_case(case, metadata) for case in qtcf_cases]
+    write_outputs(interval_results, schwarz_results, metadata)
+    failed_runs = [(result.case.slug, method) for result in schwarz_results
+        for method in METHODS if result.rows[method].failed]
+    isempty(failed_runs) || error("Some Schwarz experiments failed; inspect numbers/schwarz_summary.csv: $failed_runs")
+    println("Completed all 28 fits.")
+    println("Saved 4 figures as PDF and PNG, plus 11 CSV data files, to ", OUTPUT)
+    (; interval_results, schwarz_results, metadata)
 end
 
-function in_window(poles, limits)
-    xmin, xmax, ymin, ymax = limits
-    isfinite.(poles) .&
-        (xmin .<= real.(poles)) .& (real.(poles) .<= xmax) .&
-        (ymin .<= imag.(poles)) .& (imag.(poles) .<= ymax)
-end
-
-const CONTINUUM_COLORRANGE = let
-    logs = Float64[]
-    for result in schwarz_results, method in (:AAA, :TCF, :QTCF)
-        row = result.rows[method]
-        keep = in_window(row.pole, CONTINUUM_LIMITS) .& isfinite.(row.residue)
-        append!(logs, log10.(abs.(row.residue[keep]) .+ eps(T)))
-    end
-    sort!(logs)
-    if isempty(logs)
-        lo, hi = -4, 0
-    else
-        n = length(logs)
-        lo = floor(Int, logs[clamp(ceil(Int, 0.10n), 1, n)])
-        hi = ceil(Int, logs[clamp(ceil(Int, 0.99n), 1, n)])
-        lo == hi && (lo -= 1)
-    end
-    (Float64(lo), Float64(hi))
-end
-
-function residue_power_ticks(lo, hi)
-    lower = floor(Int, lo)
-    upper = ceil(Int, hi)
-    step = max(1, cld(abs(lower), 4))
-    exponents = collect(lower:step:-1)
-    lo <= 0 <= hi && push!(exponents, 0)
-    upper > 0 && push!(exponents, upper)
-    unique!(sort!(exponents))
-    Float64.(exponents), [LaTeXString("10^{$exponent}") for exponent in exponents]
-end
-
-function write_continuum_pole_data(result)
-    case = result.case
-    open(joinpath(NUMBERS, case.slug * "_poles_residues.csv"), "w") do io
-        println(io, "method,index,pole_real,pole_imag,residue_real,residue_imag,log10_abs_residue,in_plot_window")
-        for method in (:AAA, :TCF, :QTCF)
-            row = result.rows[method]
-            count = min(length(row.pole), length(row.residue))
-            inside = in_window(row.pole, CONTINUUM_LIMITS)
-            for k in 1:count
-                residue_log = log10(abs(row.residue[k]) + eps(T))
-                println(io, join((method, k,
-                    real(row.pole[k]), imag(row.pole[k]),
-                    real(row.residue[k]), imag(row.residue[k]),
-                    residue_log, inside[k]), ','))
-            end
-        end
-    end
-end
-
-function continuum_pole_figure(results, number)
-    methods = (:AAA, :TCF, :QTCF)
-    lo, hi = CONTINUUM_COLORRANGE
-
-    nrows = length(results)
-    figure = Figure(size=(720, 760), fontsize=8.5, figure_padding=2)
-    for (j, method) in enumerate(methods)
-        Label(figure[0, j], String(method); fontsize=13, font=:bold)
-    end
-    last_scatter = nothing
-    for (i, result) in enumerate(results)
-        case = result.case
-        plot_row = 2i - 1
-        for (j, method) in enumerate(methods)
-            row = result.rows[method]
-            axis = Axis(figure[plot_row, j]; aspect=DataAspect(), limits=CONTINUUM_LIMITS,
-                title=CASE_LABELS[case.slug], titlesize=9,
-                xlabel="Re z", ylabel="Im z", xlabelsize=8, ylabelsize=8,
-                xticks=CONTINUUM_TICKS, yticks=CONTINUUM_TICKS,
-                xticklabelsize=7, yticklabelsize=7)
-            lines!(axis, real.(result.curve), imag.(result.curve);
-                color=AAA_COLOR, linewidth=1.15)
-            keep = in_window(row.pole, CONTINUUM_LIMITS) .& isfinite.(row.residue)
-            if any(keep)
-                last_scatter = scatter!(axis,
-                    real.(row.pole[keep]), imag.(row.pole[keep]);
-                    color=log10.(abs.(row.residue[keep]) .+ eps(T)),
-                    colormap=Reverse(:thermal), colorrange=(lo, hi), markersize=5.0)
-            end
-        end
-        Label(figure[2i, 1:3], LaTeXString(case.formula); fontsize=9)
-    end
-    tick_positions, tick_labels = residue_power_ticks(lo, hi)
-    last_scatter !== nothing && Colorbar(figure[1:2nrows, 5], last_scatter;
-        label="residue", ticks=(tick_positions, tick_labels),
-        labelsize=9, ticklabelsize=7)
-    for column in 1:3
-        colsize!(figure.layout, column, Fixed(175))
-    end
-    colsize!(figure.layout, 4, Fixed(24))
-    for row in 1:nrows
-        rowsize!(figure.layout, 2row - 1, Fixed(175))
-        rowsize!(figure.layout, 2row, Fixed(17))
-    end
-    rowgap!(figure.layout, 2)
-    for row in 1:nrows-1
-        rowgap!(figure.layout, 2row, 10)
-    end
-    colgap!(figure.layout, 16)
-    colgap!(figure.layout, 3, 0)
-    colgap!(figure.layout, 4, 0)
-    resize_to_layout!(figure)
-
-    name = "Figure_6_$(number)_continuum_poles_$(number - 1)"
-    save_figure(name, figure)
-    name
-end
-
-write_continuum_summary()
-write_continuum_pole_data.(schwarz_results)
-groups = [schwarz_results[i:min(i + 3, end)] for i in 1:4:length(schwarz_results)]
-for (i, group) in enumerate(groups)
-    continuum_pole_figure(group, i + 1)
-end
-
-failed_runs = [(result.case.slug, method) for result in schwarz_results
-    for method in (:AAA, :TCF, :QTCF) if result.rows[method].failed]
-isempty(failed_runs) || error("Some Schwarz experiments failed; inspect numbers/schwarz_summary.csv: $failed_runs")
-
-println("Completed all 28 fits for Figures 6.1–6.3.")
-println("Saved 3 figures as PDF and PNG, plus 10 CSV data files, to ", OUTPUT)
+abspath(PROGRAM_FILE) == (@__FILE__) && run_experiments()

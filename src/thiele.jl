@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     Thiele (type)
 
@@ -142,7 +143,7 @@ end
 # In-place evaluation with caller-supplied scratch `a`, `b` (same shape as `t`),
 # so a hot loop can reuse them instead of allocating on every call.
 function evaluate!(t::AbstractArray, r::Thiele, z::AbstractArray{<:Number},
-    a::AbstractArray, b::AbstractArray)
+    a::AbstractArray, b::AbstractArray; fallback=false)
     # use 3-term pair recurrence to avoid division until the end
     n = length(r.weights)
     if n == 1
@@ -151,14 +152,16 @@ function evaluate!(t::AbstractArray, r::Thiele, z::AbstractArray{<:Number},
         a .= r.weights[n]
         b .= z .- r.nodes[n-1]
         @inbounds for k in n-1:-1:2
-            t .= b
-            axpy!(r.weights[k], a, t)
-            b .= a .* (z .- r.nodes[k-1])
-            a .= t
+            axpy!(r.weights[k], a, b)
+            a .*= z .- r.nodes[k-1]
+            a, b = b, a
         end
         t .= r.weights[1] .+ b ./ a
-        # retroactively correct at infinite inputs
-        t[isinf.(z)] .= r(Inf)
+    end
+    # Correct exceptional inputs, optionally retrying nonfinite array results.
+    for i in eachindex(t, z)
+        (isinf(z[i]) || (fallback && (isnan(z[i]) || !isfinite(t[i])))) &&
+            (t[i] = evaluate(r, z[i], OneDiv()))
     end
     return t
 end
@@ -172,7 +175,7 @@ function _evaluate_classic(r::Thiele, z::Number)
     return u
 end
 
-function _evaluate_onediv(r::Thiele, z::Number)
+function _evaluate_onediv(r::AbstractRationalInterpolant, z::Number)
     numer, denom = _evaluate_numden(r, z)
     return if iszero(denom)
         @debug "Evaluation produced a division by zero at " z
@@ -182,11 +185,11 @@ function _evaluate_onediv(r::Thiele, z::Number)
     end
 end
 
-_evaluate(r::Thiele, z, ::OneDiv)  = _evaluate_onediv(r, z)
-_evaluate(r::Thiele, z, ::Classic) = _evaluate_classic(r, z)
+_evaluate(r::AbstractRationalInterpolant, z, ::OneDiv)  = _evaluate_onediv(r, z)
+_evaluate(r::AbstractRationalInterpolant, z, ::Classic) = _evaluate_classic(r, z)
 
 guard(z) = !iszero(z) && abs(real(z)) < 1e-100 && abs(imag(z)) < 1e-100
-function _evaluate_numden(r::Thiele, z::Number)
+function _evaluate_numden(r::Thiele, z::Number; underflow_guard=true)
     # use 3-term pair recurrence to avoid division until the end
     @assert isfinite(z)
     n = length(r.weights)
@@ -199,7 +202,7 @@ function _evaluate_numden(r::Thiele, z::Number)
             t = r.weights[k] * a + b
             b = a * (z - r.nodes[k-1])
             a = t
-            if guard(a)    # prevent underflow
+            if underflow_guard && guard(a)    # prevent underflow
                 @debug "scaling to avoid underflow at " z
                 a *= 1e100
                 b *= 1e100
@@ -209,17 +212,22 @@ function _evaluate_numden(r::Thiele, z::Number)
     end
 end
 
-function _derivative!(ζ, w, z, order, A, B, vals)
+# Recover derivatives with one reciprocal, or fill numerator/denominator jets.
+function _derivative!(ζ, w, z, order, A, B, vals; underflow_guard=true, quotient=true)
     n = length(w)
-    if n == 1
-        vals[1] = w[1]
+    if n <= 1
+        A[1] = n == 0 ? zero(eltype(A)) : w[1]
+        B[1] = one(eltype(B))
+        A[2:order+1] .= 0; B[2:order+1] .= 0
+        quotient || return nothing
+        vals[1] = A[1]
         vals[2:order+1] .= 0
         return vals
     end
     A[1] = w[n]
     A[2:order+1] .= 0
     B[1] = ζ - z[n-1]
-    B[2] = 1
+    order > 0 && (B[2] = 1)
     B[3:order+1] .= 0
     @inbounds for k in n-1:-1:2
         d = ζ - z[k-1]
@@ -228,18 +236,25 @@ function _derivative!(ζ, w, z, order, A, B, vals)
             B[m+1] = d * A[m+1] + (m > 0 ? m * A[m] : 0)
             A[m+1] = t
         end
-        if any(guard, A)
-            A .*= 1e50
-            B .*= 1e50
+        if underflow_guard && any(guard, @view A[1:order+1])
+            @views A[1:order+1] .*= 1e50
+            @views B[1:order+1] .*= 1e50
             @debug "scaling to avoid underflow at " ζ
         end
     end
     # numer derivs = w[1] * A + B
     # denom derivs = A
-    vals[1] = w[1]  + B[1] / A[1]
+    if !quotient
+        for j in 1:order+1
+            A[j], B[j] = w[1] * A[j] + B[j], A[j]
+        end
+        return nothing
+    end
+    inv_denom = inv(A[1])
+    vals[1] = w[1] + B[1] * inv_denom
     for m in 1:order
         s = sum( binomial(m, j) * vals[j+1] * A[m-j+1] for j in 0:m-1 )
-        vals[m+1] = (w[1] * A[m+1] + B[m+1] - s) / A[1]
+        vals[m+1] = (w[1] * A[m+1] + B[m+1] - s) * inv_denom
     end
     return vals
 end
@@ -305,26 +320,38 @@ end
 
 function roots(r::Thiele{S,T}) where {S,T}
     n = length(r.nodes)
+    n == 0 && return T[]
     C = diagm(1 => -ones(T, n-1))
     xi = view(r.nodes, 1:n-1)
     D = diagm(0 => r.weights, -1 => -ones(T, n-1), 1 => -xi)
-    return filter(isfinite, eigvals(D, C))
+    return try
+        filter(isfinite, eigvals(D, C))
+    catch
+        _, _, _, _, α, β = schur(complex(D), complex(C))
+        filter(isfinite, α ./ β)
+    end
 end
 
-function residues(r::Thiele)
-    ζ = poles(r)
-    res = similar(complex(ζ))
-    T = real_type(eltype(ζ))
+# Compute TCF poles and pass them to the shared residue loop.
+residues(r::Thiele; check_finite=false, radius=nothing) =
+    residues(r, poles(r); check_finite, radius)
+
+# Extract residues at supplied poles; a callback can reuse numerator/denominator workspace.
+function residues(r::AbstractRationalInterpolant, ζ;
+    check_finite=false, radius=nothing, numden=_evaluate_numden_derivs)
+    res = similar(ζ, complex(eltype(ζ)))
     for i in eachindex(ζ)
         # is it a simple pole?
-        p, q, pʹ, qʹ = _evaluate_numden_derivs(r, ζ[i])
-        if !iszero(qʹ)
+        p, q, pʹ, qʹ = numden(r, ζ[i])
+        candidate = iszero(qʹ) ? oftype(p, NaN) : p / qʹ
+        if !iszero(qʹ) && (!check_finite || isfinite(candidate))
             # simple pole
-            res[i] = p / qʹ
+            res[i] = candidate
         else
             @debug "Fallback for residue at pole " ζ[i]
             # not a simple pole; use fallback contour integral
-            res[i] = Res(r, ζ[i]; avoid=ζ)
+            res[i] = radius === nothing ? Res(r, ζ[i]; avoid=ζ) :
+                Res(r, ζ[i]; avoid=ζ, radius=radius(ζ[i]))
         end
     end
     return ζ, res

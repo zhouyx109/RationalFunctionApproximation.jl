@@ -15,176 +15,40 @@ The [documentation](https://complexvariables.github.io/RationalFunctionApproxima
 
 ## Quadratic Thiele approximation
 
-This checkout starts from the official `v0.4.1` tag, commit
-`abdc2c0b4c690898cdd5c9114b1dced969b4d621`. The QTCF algorithm is
-[`src/Quadratic_Thiele.jl`](src/Quadratic_Thiele.jl).
-
-QTCF uses the current positional method selector:
+This fork adds quadratic Thiele continued fractions (QTCF) to RFA v0.4.1.
+Select `QTCF()` explicitly, or use `symmetric` to wrap the target and domain:
 
 ```julia
-r = approximate(f, domain, QTCF(); allowed=:strict)
-status(r)
-isconverged(r)
+using RationalFunctionApproximation, ComplexRegions
+
+r = approximate(symmetric(abs), symmetric(Segment(-1, 1));
+    stagnation=200, max_degree=200)
 ```
 
-`symmetric(s::Segment)` automatically pairs points by reflection about the
-segment's midpoint: `z -> 2c - z`, where `c` is the midpoint. This pairs
-`x` with `-x` on `Segment(-1, 1)` and `im*x` with `-im*x` on
-`Segment(-1im, 1im)`:
+The domain wrapper pairs points about the segment's midpoint. The function
+wrapper specifies the value map, defaulting to `conj`. This implementation
+retains the paper experiment routines, general derivatives, and Thiele
+counterparts for construction, evaluation, conversion, and arithmetic.
 
-```julia
-r = approximate(abs, symmetric(Segment(-1, 1)); stagnation=200, max_degree=200)
-```
-
-An explicit `reflection` keyword takes precedence, including
-`reflection=nothing` to retain unconstrained greedy pairing. Other domain
-types and the `Symmetric` constructor retain their existing defaults.
-This default chooses the point pairing; partner values are evaluated from
-the target function unless a function symmetry is supplied as well.
-
-`symmetric(f; reflection=conj)` wraps a target function and declares the
-map of its values. The function remains callable and returns the same
-values as `f`. Together, the two wrappers specify the relation
-`f(point_reflection(z)) == value_reflection(f(z))`:
-
-```julia
-r = approximate(
-    symmetric(abs),
-    symmetric(Segment(-1, 1));
-    stagnation=200, max_degree=200,
-)
-```
-
-Here the domain wrapper pairs `x` with `-x`, and the function wrapper
-conjugates values. Since `abs` is real and even, the relation holds.
-Use `symmetric(f; reflection=identity)` for equal paired values, or
-`symmetric(f; reflection=y -> -y)` for opposite paired values. Conjugating
-values does not itself choose a point pairing or imply evenness.
-
-A wrapped function requires a point reflection from a domain wrapper or
-the `reflection` keyword of `approximate`. It selects QTCF by default.
-The declared value relation is checked at sampled reflected points; this
-is a numerical check, not a proof of symmetry over the whole domain.
-Existing calls with a plain function and the three-argument
-`value_reflection=(z, y, zr) -> ...` keyword remain supported. Do not
-supply that keyword together with a wrapped function.
-
-As in TCF, `allowed=true` skips pole checks, and `allowed=p -> ...`
-supplies a pole predicate. With `allowed=:strict`, poles must be off a
-curve or outside a region, depending on the domain passed in. QTCF checks
-all computed poles before reporting convergence. On unsuccessful stopping,
-it selects the lowest-error acceptable assessed history entry using the
-package's shared selector; if none is acceptable, the selector falls back
-to the last assessed entry without reporting convergence. Trial
-approximants may contain disallowed poles. QTCF's `status(r).iterations`
-counts constructed blocks, including stages omitted from its recorded
-history.
-
-QTCF assigns a nonfinite residual an infinite error estimate and excludes
-that candidate from residual ranking, including when linearized residuals
-are requested. Finite candidates remain eligible. A reflection that fixes
-every point uses QTCF singleton blocks, so the same residual policy applies.
-
-A new QTCF block requires finite target values, finite final reduced values,
-and finite stored denominator coefficients. Singleton infinite values,
-two-infinity pairs, mixed finite/infinite pairs, and NaN values are rejected.
-Greedy construction tries another candidate block; direct `add_node!`
-rejects the update before modifying the interpolant. Intermediate projective
-infinities are permitted during reduction when the final reduced value is
-finite. Zero coefficients remain admissible. No previous-node attainment
-audit or per-node cancellation diagnostic is performed.
-
-QTCF uses the same public operation names as TCF: `nodes`, `values`,
-`weights`, `degrees`, `degree`, `copy`, `isreal`, `evaluate`, `derivative`,
-`poles`, `roots`, and `residues`. Numeric conversion and scalar arithmetic
-also return QTCF objects. The `.values` and `.weights` properties are
-available; QTCF weights are coefficient vectors for denominator blocks.
-
-```julia
-g = get_function(r)
-evaluate(g, z, Classic())
-evaluate(g, points, OneDiv())
-RFA.evaluate!(output, g, points)
-RFA.evaluate!(output, g, points, numerator_scratch, denominator_scratch)
-derivative(g, [0, 1, 2])(z)
-convert(BigFloat, g)
-```
-
-Array evaluation preserves the input shape. Output and scratch arrays must
-have matching axes; scratch arrays must not overlap. `set_eval_method`
-controls QTCF's default scalar and array evaluator. The derivative recovery
-reuses one denominator reciprocal for the value and all requested orders.
-Evaluation has no per-step normalization. As in TCF, scalar OneDiv
-evaluation rescales an intermediate numerator/denominator pair only when
-the shared underflow guard triggers, and derivative evaluation applies
-the corresponding derivative safeguard. Array OneDiv evaluation and
-the numerator/denominator derivatives used for residues are unscaled.
-A zero OneDiv denominator triggers Classic evaluation; this is not an attainability check. Pole extraction returns roots of the unreduced
-denominator. Partial-fraction conversion assumes simple poles and rejects
-exactly repeated computed poles; the contour residue fallback returns only
-the residue at a multiple pole, not its full principal part.
-
-Direct construction follows the supplied node order. `QTCF(z, y)` uses
-singleton blocks. Use `block_sizes` to prescribe consecutive pairs or
-mixed blocks, and supply it when rebuilding paired weights:
-
-```julia
-g = QTCF(z, y; block_sizes=[2, 1, 2])
-h = QTCF(nodes(g), values(g), weights(g); block_sizes=[2, 1, 2])
-RFA.add_node!(g, z_new, y_new)
-RFA.add_node!(g, [z1, z2], [y1, y2], Classic())
-```
-
-`add_node!` returns the updated object and accepts one node or a two-node
-block. `set_weight_method` controls the default method for these direct
-updates and direct construction. Existing greedy approximation retains
-its block-reduction implementation. `QTCF{Float32}(z, y)` and
-`convert(Float32, g)` provide typed construction and conversion.
-
-Both sampled and continuum `approximate` calls accept `float_type` for
-coefficient storage. Sampled symmetric inputs may use
-`approximate(y, Symmetric(z; reflection=conj), QTCF())`. Approximation
-results share `get_function`, `domain`, `status`, `isconverged`,
-`test_points`, `check`, `get_history`, and `rewind` with TCF. Rewinding
-preserves the original iteration count and updates the selected history
-index and, for sampled data, the test-point mask.
-
-QTCF counts iterations in blocks; TCF counts individual node updates.
-QTCF keeps its block-specific refinement, symmetry, and selection options.
-The shared `max_degree`, `max_iter`, `tol`, `allowed`, `refinement`, and
-`stagnation` keyword names follow the package interface, with budgets
-interpreted for each representation.
-
-[`test/qtcf_test.jl`](test/qtcf_test.jl) runs only the experiments in Section 6
-of *Greedy quadratic Thiele approximation*: two absolute-value interval
-comparisons and eight Schwarz-function curves, producing Figures 6.1–6.3.
-From the package directory, with Julia 1.11 or later, run:
+See the [QTCF guide](docs/src/qtcf.md) for symmetry choices and evaluation.
+The [experiment runner](test/qtcf_test.jl) reproduces the paper's
+two interval comparisons and eight Schwarz-function examples:
 
 ```sh
 julia --project=test -e 'using Pkg; Pkg.instantiate()'
 julia --project=test test/qtcf_test.jl
+julia --project=test test/qtcf_discrete_test.jl
 ```
 
-The full paper settings are built into the runner. Its output is saved in
-`test/qtcf_output/figures/` (three figures as PDF and PNG) and
-`test/qtcf_output/numbers/` (ten CSV data files). Rerunning replaces these
-Section 6 outputs. The experiment runner is invoked separately from the
-upstream package regression suite in `test/runtests.jl`.
-
-Every QTCF experiment wraps both its target function and its domain:
-`approximate(symmetric(f; reflection=...), symmetric(domain; reflection=...); ...)`.
-The interval cases use the default function-value conjugation and the
-automatic `Segment` midpoint reflection. For the Schwarz target `f=conj`,
-the eight curves specify the matching value map: `y -> -y` for point
-reflection `z -> -z`, `y -> -conj(y)` for `z -> -conj(z)`, and `conj` for
-point reflection `conj`.
-
-The test environment requires Julia 1.11 or later. Run the upstream package
-regression suite with:
-
-```sh
-julia --project=test test/runtests.jl
-```
+Run with Julia 1.11 or later from this directory. Figures and numerical data
+are written to `test/qtcf_output/figures/` and `test/qtcf_output/numbers/`.
+The discrete runner writes the same figures and CSV formats to
+`test/qtcf_discrete_output/`. Each case uses one fixed shared grid: 5,000
+uniform parameter points, all continuum support nodes, and logarithmic
+parameter neighbors. The real and imaginary intervals use exactly rotated
+copies of the same grid. Both runners also write an `index.html` figure gallery.
+Presets and curve definitions are in [qtcf_parameters.jl](test/qtcf_parameters.jl);
+all figure, CSV, and HTML generation is in [qtcf_output.jl](test/qtcf_output.jl).
 
 ## Related work
 
