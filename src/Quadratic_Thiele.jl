@@ -348,7 +348,7 @@ function _padd(p, q)
     r = zeros(promote_type(eltype(p), eltype(q)), n)
     @views r[1:length(p)] .+= p
     @views r[1:length(q)] .+= q
-    return resize!(r, something(findlast(x -> !(abs(x) <= 0), r), min(1, length(r))))
+    return resize!(r, something(findlast(!iszero, r), min(1, length(r))))
 end
 
 # %% _pmul
@@ -358,7 +358,7 @@ function _pmul(p, q)
     @inbounds for i in eachindex(p), j in eachindex(q)
         r[i+j-1] += p[i] * q[j]
     end
-    return resize!(r, something(findlast(x -> !(abs(x) <= 0), r), min(1, length(r))))
+    return resize!(r, something(findlast(!iszero, r), min(1, length(r))))
 end
 
 # %% _evaluate_block_derivs
@@ -773,9 +773,7 @@ function QuadraticThiele(
 
     # Reject nonfinite or repeated nodes before constructing any blocks.
     all(isfinite, z) || throw(ArgumentError("interpolation nodes must be finite"))
-    bound = 100eps(Float64) * maximum(abs, z; init=1)
-    any(abs(real(z[i]) - real(z[j])) <= bound && abs(imag(z[i]) - imag(z[j])) <= bound &&
-        _same(z[i], z[j]) for i in eachindex(z) for j in firstindex(z):i-1) &&
+    any(_same(z[i], z[j]) for i in eachindex(z) for j in firstindex(z):i-1) &&
         throw(ArgumentError("interpolation nodes must be distinct"))
 
     # Singleton blocks use the Thiele representation.
@@ -862,7 +860,7 @@ function add_node!(
     all(isfinite, y) || throw(ArgumentError("QTCF block target values must be finite"))
 
     # Reject nodes already selected or coinciding within the pair.
-    any(t -> any(w -> _same(t, w), r.nodes), z) &&
+    any(t -> _is_selected_node(r, t), z) &&
         throw(ArgumentError("interpolation nodes must be distinct"))
     _same(first(z), last(z)) &&
         throw(ArgumentError("a two-point block requires distinct nodes"))
@@ -914,11 +912,7 @@ end
 # Test whether the proposed node matches a stored node.
 function _is_selected_node(r::QuadraticThiele, z)
     z = convert(eltype(r), z)
-    scale = max(1, abs(real(z)) + abs(imag(z)))
-    return any(nodes(r)) do w
-        bound = 200eps(Float64) * max(scale, abs(real(w)) + abs(imag(w)))
-        abs(real(z) - real(w)) <= bound && abs(imag(z) - imag(w)) <= bound && _same(z, w)
-    end
+    return any(w -> _same(z, w), nodes(r))
 end
 
 # %% _new_weight
@@ -1363,7 +1357,8 @@ function approximate(
 
     # Check value symmetry and detect equal values at reflected points.
     if paired
-        probe_values, reflected_values = S[], S[]
+        equality, scale, probes = 0.0, 1.0, 0
+        V = promote_type(ComplexF64, S)
         for sprobe in stest
             zprobe = S(point(d, _clean_param(d, sprobe)))
             zrprobe = S(reflection(zprobe))
@@ -1376,18 +1371,13 @@ function approximate(
                 yrprobe = mapped
             end
             _same(zprobe, zrprobe) && continue
-            push!(probe_values, yprobe)
-            push!(reflected_values, yrprobe)
-            length(probe_values) == 16 && break
+            y, yr = V(yprobe), V(yrprobe)
+            scale = max(scale, abs(y), abs(yr))
+            equality = max(equality, abs(yr - y))
+            probes += 1
+            probes == 16 && break
         end
-
-        if !isempty(probe_values)
-            V = promote_type(ComplexF64, eltype(probe_values), eltype(reflected_values))
-            y, yr = V.(probe_values), V.(reflected_values)
-            scale = max(1.0, maximum(abs, y; init=0.0), maximum(abs, yr; init=0.0))
-            equality = maximum(abs, yr .- y; init=0.0) / scale
-            value_mode = equality <= 1000eps(Float64) ? :equality : :generic
-        end
+        probes > 0 && equality / scale <= 1000eps(Float64) && (value_mode = :equality)
     end
 
     # Try a block at the supplied parameters; return whether it was accepted.
@@ -1442,13 +1432,9 @@ function approximate(
         end
 
         # Refine at both parameters.
-        if paired
-            s_nodes = _mesh_params(d, s_nodes, (s1, s2), typeof(s1))
-        else
-            fmax = max(fmax, abs(y1), abs(y2))
-            s_nodes = _mesh_params(d, s_nodes, (s1, s2),
-                promote_type(eltype(s_nodes), typeof(s1), typeof(s2)))
-        end
+        paired || (fmax = max(fmax, abs(y1), abs(y2)))
+        Tmesh = paired ? typeof(s1) : promote_type(eltype(s_nodes), typeof(s1), typeof(s2))
+        s_nodes = _mesh_params(d, s_nodes, (s1, s2), Tmesh)
         return true
     end
 
@@ -1550,7 +1536,8 @@ end
 
 Fit sampled values `y` on the grid `z` with quadratic Thiele blocks.
 `reflection` optionally pairs nodes on a reflection-closed grid; otherwise
-the two largest residuals select each new pair. `max_iter` counts blocks. The stopping
+the two largest residuals select each new pair. Minimum magnitudes tied to rounding
+prefer a fixed point of the supplied reflection at startup. `max_iter` counts blocks. The stopping
 error is relative to the sampled target scale.
 Every convergent is recorded. Error checks use the whole grid, including selected
 nodes; only unselected nodes are eligible for the next block.
@@ -1568,11 +1555,17 @@ function approximate(
     reflection::Union{Nothing,Function} = nothing
     ) where {T<:Number,Z<:Number,F}
 
-    # Choose the scalar TCF startup node.
-    _, idx_min = findmin(abs, y)
+    # Choose the scalar TCF startup node, preferring a fixed point in rounding ties.
+    smallest, idx_min = findmin(abs, y)
     zgrid, fgrid = z, y
     tol = convert(float_type, tol)
     paired = reflection !== nothing
+    if paired && isfinite(smallest) && z[idx_min] != reflection(z[idx_min])
+        fixed = findfirst(eachindex(z)) do i
+            abs(y[i]) - smallest <= 4eps(float(smallest)) && z[i] == reflection(z[i])
+        end
+        idx_min = something(fixed, idx_min)
+    end
 
     # Build the node lookup and locate each reflected partner.
     S = complex(float_type)

@@ -28,6 +28,7 @@ function record_discrete_run!(metadata, slug, method, result, grid, seed_nodes, 
     off_grid = count(z -> z ∉ grid.exact && !any(==(z), grid.points), support)
     off_grid == 0 || error("$slug/$method selected $off_grid off-grid nodes")
     stop = status(result)
+    isequal(result.domain, grid.points) || error("$slug/$method changed the shared fitting grid")
     push!(metadata, (; case=slug, method,
         grid_source=grid.source,
         uniform_parameters=DISCRETE_UNIFORM_N, uniform_endpoint_included=false,
@@ -109,22 +110,18 @@ function residue_colorrange(schwarz_results)
         keep = in_window(row.pole, CONTINUUM_LIMITS) .& isfinite.(row.residue)
         append!(logs, log10.(abs.(row.residue[keep]) .+ eps(T)))
     end
-    # Use shared residue limits so every panel has the same color scale.
+    # Share residue limits across all panels.
+    isempty(logs) && return (-4.0, 0.0)
     sort!(logs)
-    if isempty(logs)
-        lo, hi = -4, 0
-    else
-        n = length(logs)
-        lo = floor(Int, logs[clamp(ceil(Int, 0.10n), 1, n)])
-        hi = ceil(Int, logs[clamp(ceil(Int, 0.99n), 1, n)])
-        lo == hi && (lo -= 1)
-    end
+    n = length(logs)
+    lo = floor(Int, logs[clamp(ceil(Int, 0.10n), 1, n)])
+    hi = ceil(Int, logs[clamp(ceil(Int, 0.99n), 1, n)])
+    lo == hi && (lo -= 1)
     (Float64(lo), Float64(hi))
 end
 
 function residue_power_ticks(lo, hi)
-    lower = floor(Int, lo)
-    upper = ceil(Int, hi)
+    lower, upper = floor(Int, lo), ceil(Int, hi)
     step = max(1, cld(abs(lower), 4))
     exponents = collect(lower:step:-1)
     lo <= 0 <= hi && push!(exponents, 0)
@@ -200,19 +197,17 @@ function write_outputs(interval_results, schwarz_results, metadata)
             row.rational_degrees..., row.elapsed, row.failed, row.selected_nodes,
             row.recorded, row.returned_record, row.sampled_error, row.stop_reason)
             for result in schwarz_results for method in METHODS for row in (result.rows[method],)))
-    if EXPERIMENT_MODE === :continuum
-        cases = [(case.slug, [:TCF, :QTCF], length(case.points), 1.0 + 0.0im)
-            for case in interval_cases]
-        append!(cases, [(case.slug, collect(METHODS), SCHWARZ_AUDIT_N, case.rotation) for case in qtcf_cases])
-        write_csv("experiment_parameters.csv",
-            "case,method,float_type,tol,max_degree,max_iter,initial_refinement,refinement,stagnation,allowed,validation_points,blas_threads,coordinate_rotation",
-            ((slug, method, T, p.tol, p.max_degree,
-                method === :TCF ? 2p.max_degree : p.max_degree,
-                method === :QTCF ? p.initial_refinement : RFA_INITIAL_REFINEMENT,
-                p.refinement, p.stagnation, p.allowed, n, BLAS.get_num_threads(), rotation)
-                for (slug, methods, n, rotation) in cases for method in methods
-                for p in (method === :QTCF ? CONTINUUM_QTCF_PARAMETERS : CONTINUUM_PARAMETERS,)))
-    elseif !isempty(metadata)
+    cases = Tuple[(case.slug, :interval, (:TCF, :QTCF), length(case.points), 1.0 + 0.0im)
+        for case in interval_cases]
+    append!(cases, [(case.slug, :schwarz, METHODS, SCHWARZ_AUDIT_N, case.rotation) for case in qtcf_cases])
+    write_csv("experiment_parameters.csv",
+        "case,family,method,float_type,tol,max_degree,max_iter,qtcf_initial_refinement,refinement,stagnation,allowed,validation_points,blas_threads,coordinate_rotation",
+        ((slug, family, method, T, p.tol, p.max_degree, options.max_iter, p.initial_refinement,
+            p.refinement, p.stagnation, p.allowed, n, BLAS.get_num_threads(), rotation)
+            for (slug, family, methods, n, rotation) in cases for method in methods
+            for p in (EXPERIMENT_PARAMETERS[family],)
+            for options in (experiment_parameters(family, method; discrete=EXPERIMENT_MODE === :discrete),)))
+    if !isempty(metadata)
         write_csv("discrete_grid_metadata.csv", join(keys(first(metadata)), ','), values.(metadata))
     end
     for result in schwarz_results
@@ -232,31 +227,26 @@ function write_outputs(interval_results, schwarz_results, metadata)
     continuum_pole_figure(schwarz_results[2:2], 2;
         name="Figure_1", show_formula=false, colorrange)
 
-    open(joinpath(OUTPUT, "index.html"), "w") do io
-        println(io, "<!doctype html><html lang='en'><meta charset='utf-8'>",
-            "<meta name='viewport' content='width=device-width,initial-scale=1'>",
-            "<title>QTCF ", EXPERIMENT_MODE, " experiments</title>",
-            "<style>body{font:16px system-ui;max-width:1100px;margin:2em auto;padding:0 1em}",
-            "img{max-width:100%;height:auto}section{margin:2em 0}a{margin-right:1em}</style>",
-            "<h1>QTCF ", EXPERIMENT_MODE, " experiments</h1>",
-            "<p>All numerical examples; errors use the independent validation grids.</p>",
-            "<p><a href='numbers/schwarz_summary.csv'>Schwarz summary CSV</a>",
-            "<a href='numbers/interval_convergence.csv'>Interval convergence CSV</a></p>")
-        p = CONTINUUM_PARAMETERS
-        EXPERIMENT_MODE === :continuum && println(io,
-            "<p>Every continuum case uses ", T, ", relative tolerance ", p.tol,
-            ", degree limit ", p.max_degree,
-            ", initial refinement ", CONTINUUM_QTCF_PARAMETERS.initial_refinement,
-            ", steady refinement ", p.refinement, ", stagnation ", p.stagnation, ", ",
-            "and unrestricted poles. Iteration limits follow each method's degree convention.</p>",
-            "<p><a href='numbers/experiment_parameters.csv'>Complete shared parameter preset</a></p>")
-        EXPERIMENT_MODE === :discrete && println(io,
-            "<p><a href='numbers/discrete_grid_metadata.csv'>Shared fixed-grid metadata CSV</a></p>")
-        for (name, title) in FIGURE_TITLES
-            println(io, "<section><h2>", title, "</h2><p><a href='figures/", name,
-                ".pdf'>PDF</a><a href='figures/", name, ".png'>PNG</a></p><img src='figures/",
-                name, ".png' alt='", title, "'></section>")
-        end
-        println(io, "</html>")
-    end
+    grid_link = isempty(metadata) ? "" :
+        "<p><a href='numbers/discrete_grid_metadata.csv'>Shared fixed-grid metadata CSV</a></p>"
+    figures = join(("<section><h2>$title</h2><p><a href='figures/$name.pdf'>PDF</a><a href='figures/$name.png'>PNG</a></p><img src='figures/$name.png' alt='$title'></section>"
+        for (name, title) in FIGURE_TITLES), '\n')
+    presets = join(("<li>$family: relative tolerance $(p.tol), degree limit $(p.max_degree), QTCF initial refinement $(p.initial_refinement), steady refinement $(p.refinement), stagnation $(p.stagnation).</li>"
+        for (family, p) in pairs(EXPERIMENT_PARAMETERS)), '\n')
+    write(joinpath(OUTPUT, "index.html"), """
+        <!doctype html><html lang='en'><meta charset='utf-8'>
+        <meta name='viewport' content='width=device-width,initial-scale=1'>
+        <title>QTCF $EXPERIMENT_MODE experiments</title>
+        <style>body{font:16px system-ui;max-width:1100px;margin:2em auto;padding:0 1em}
+        img{max-width:100%;height:auto}section{margin:2em 0}a{margin-right:1em}</style>
+        <h1>QTCF $EXPERIMENT_MODE experiments</h1>
+        <p>All numerical examples; errors use the independent validation grids.</p>
+        <p><a href='numbers/schwarz_summary.csv'>Schwarz summary CSV</a><a href='numbers/interval_convergence.csv'>Interval convergence CSV</a></p>
+        <p>Each experiment family shares one $T preset across both modes, with unrestricted poles. Discrete fitting uses a fixed grid; iteration limits follow each method's degree convention.</p>
+        <ul>$presets</ul>
+        <p><a href='numbers/experiment_parameters.csv'>Complete shared parameter presets</a></p>
+        $grid_link
+        $figures
+        </html>
+        """)
 end

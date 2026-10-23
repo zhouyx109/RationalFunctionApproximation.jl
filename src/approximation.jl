@@ -250,6 +250,8 @@ Adaptively compute a rational interpolant on a continuous or discrete domain.
 - `allowed`: no checking poles if `true`, must be outside domain if `:strict`, or use provided function
 - `refinement::Integer=3`: number of test points between adjacent nodes (continuum only)
 - `stagnation::Integer=5`: number of iterations to determine stagnation
+- `loewner_tol::Real=0`: relative support-point separation for AAA least-squares rows
+  (discrete only); omitted rows remain in the greedy search and error check
 
 ¹Default of `float_type` is the promotion of `float(1)` and the float type of the domain.
 

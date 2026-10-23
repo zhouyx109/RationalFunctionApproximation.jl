@@ -335,7 +335,8 @@ function loewner(nodes, node_values, samples, sample_values)
 end
 
 # add new nodes to an existing Barycentric function
-function add_node!(r::Barycentric, C, L, new_σ, new_fσ, τ, fτ, idx_test, idx_new_test)
+function add_node!(r::Barycentric, C, L, new_σ, new_fσ, τ, fτ, idx_test, idx_new_test;
+    idx_fit=idx_test)
     σ =  [r.nodes;   new_σ]
     fσ = [r.values; new_fσ]
     n = length(σ)
@@ -355,11 +356,11 @@ function add_node!(r::Barycentric, C, L, new_σ, new_fσ, τ, fτ, idx_test, idx
     end
 
     # collect the columns of the Loewner matrix
-    if isa(idx_test, CartesianIndices)
-        A = reshape(view(L, idx_test, 1:n), :, n)
+    if isa(idx_fit, CartesianIndices)
+        A = reshape(view(L, idx_fit, 1:n), :, n)
     else
         # slower route when test point indices are not contiguous
-        I = [CartesianIndex((idx, k)) for idx in idx_test, k in 1:n]
+        I = [CartesianIndex((idx, k)) for idx in idx_fit, k in 1:n]
         A = reshape(view(L, I), :, n)
     end
 
@@ -481,8 +482,10 @@ function approximate(
     max_degree::Int = min(length(y), 100),
     max_iter = max_degree,
     stagnation::Int = 5,
+    loewner_tol::Real = 0,
     ) where {T<:Number,S<:Number}
 
+    @assert isfinite(loewner_tol) && loewner_tol >= 0
     m = length(z)
     fmax = maximum(abs, y)     # scale of f
     values = complex(similar(y))
@@ -490,6 +493,9 @@ function approximate(
     _, i₀ = findmin(abs, y)
     idx_test = trues(m)
     idx_test[i₀] = false
+    separation = loewner_tol * maximum(abs, z)
+    idx_fit = copy(idx_test)
+    iszero(loewner_tol) || (idx_fit .&= abs.(z .- z[i₀]) .> separation)
 
     number_type = promote_type(eltype(z), eltype(y))
     C = Array{number_type}(undef, m, max_iter+1)
@@ -498,7 +504,7 @@ function approximate(
         C[i, 1] = 1 / (z[i] - z[i₀])
         L[i, 1] = (y[i] - y[i₀]) * C[i, 1]
     end
-    r = Barycentric([z[i₀]], [y[i₀]], view(L, idx_test, 1:1))
+    r = Barycentric([z[i₀]], [y[i₀]], view(L, any(idx_fit) ? idx_fit : idx_test, 1:1))
     history = [IterationRecord(r, NaN, missing)]
     n = 1    # iteration counter
     stop = nothing
@@ -528,7 +534,12 @@ function approximate(
 
         # Add new node:
         idx_test[idx_max] = false
-        r = add_node!(r, C, L, z[idx_max], y[idx_max], z, y, findall(idx_test), [])
+        # Near-coincident rows amplify roundoff; retain them in the error check.
+        idx_fit[idx_max] = false
+        iszero(loewner_tol) || (idx_fit .&= abs.(z .- z[idx_max]) .> separation)
+        fit = count(idx_fit) >= n + 1 ? idx_fit : idx_test
+        r = add_node!(r, C, L, z[idx_max], y[idx_max], z, y, findall(idx_test), [];
+            idx_fit=findall(fit))
         push!(history, IterationRecord(r, NaN, missing))
         n += 1
     end

@@ -1,12 +1,7 @@
 /Manifest.toml
-/docs/Manifest.toml
-/docs/build/
 .DS_Store
-.vscode
-test/Manifest.toml
-test/qtcf_output/
-test/qtcf_discrete_output/
-docs/node_modules
-*.cov
-benchmark/Manifest.toml
-.idea
+.ipynb_checkpoints/
+.vscode/
+.idea/
+/test/qtcf_output/
+/test/qtcf_discrete_output/
