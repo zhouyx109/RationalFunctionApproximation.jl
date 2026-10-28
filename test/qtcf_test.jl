@@ -144,7 +144,18 @@ function run_intervals(metadata)
         println("\nInterval continuum seed: ", case.name)
         tcf = approximate(case.f, case.domain, TCF(); experiment_parameters(:interval, :TCF)...)
         qtcf = approximate(symmetric(case.f), symmetric(case.domain);
-            experiment_parameters(:interval, :QTCF)...)
+            experiment_parameters(:interval, :QTCF)...,
+            initial_node=point(case.domain, length(case.domain) * QTCF_START_PARAMETERS[case.slug]),
+            pairs_only=true)
+        reflection = symmetric(case.domain).reflection
+        for (k, record) in enumerate(qtcf.history)
+            r = record.interpolant
+            @assert length(nodes(r)) == 2k - 1
+            @assert RFA._same(first(r.pairs)...)
+            @assert all(pair -> !RFA._same(pair...), r.pairs[2:end])
+            @assert all(pair -> RFA._same(reflection(first(pair)), last(pair)), r.pairs)
+            @assert all(b -> all(isfinite, b), RFA.weights(r))
+        end
         (tcf, qtcf)
     end
 
@@ -176,7 +187,17 @@ function run_intervals(metadata)
             tcf = approximate(case.f, grid.points, TCF();
                 experiment_parameters(:interval, :TCF; discrete=true)...)
             qtcf = approximate(symmetric(case.f), symmetric(grid.points; reflection);
-                experiment_parameters(:interval, :QTCF; discrete=true)...)
+                experiment_parameters(:interval, :QTCF; discrete=true)...,
+                initial_node=point(case.domain, length(case.domain) * QTCF_START_PARAMETERS[case.slug]),
+                pairs_only=true)
+            for (k, record) in enumerate(qtcf.history)
+                r = record.interpolant
+                @assert length(nodes(r)) == 2k - 1
+                @assert RFA._same(first(r.pairs)...)
+                @assert all(pair -> !RFA._same(pair...), r.pairs[2:end])
+                @assert all(pair -> RFA._same(reflection(first(pair)), last(pair)), r.pairs)
+                @assert all(b -> all(isfinite, b), RFA.weights(r))
+            end
             for (k, (method, result)) in enumerate(zip((:TCF, :QTCF), (tcf, qtcf)))
                 record_discrete_run!(metadata, case.slug, method, result, grid,
                     grid.seed_node_counts[k], length(case.points))
@@ -195,12 +216,26 @@ end
 
 function fit_schwarz(case, method; points=nothing)
     domain = points === nothing ? case.fit_domain : points
+    startup = method === :QTCF ?
+        (; initial_node=point(case.fit_domain,
+            length(case.fit_domain) * QTCF_START_PARAMETERS[case.slug]), pairs_only=true) : (;)
     f, domain, algorithm = method === :QTCF ?
         (symmetric(conj; reflection=case.function_reflection),
             symmetric(domain; reflection=case.reflection), QTCF()) :
         (conj, domain, method === :AAA ? AAA() : TCF())
-    approximate(f, domain, algorithm;
-        experiment_parameters(:schwarz, method; discrete=points !== nothing)...)
+    result = approximate(f, domain, algorithm;
+        experiment_parameters(:schwarz, method; discrete=points !== nothing)..., startup...)
+    if method === :QTCF
+        for (k, record) in enumerate(result.history)
+            r = record.interpolant
+            @assert length(nodes(r)) == 2k - 1
+            @assert RFA._same(first(r.pairs)...)
+            @assert all(pair -> !RFA._same(pair...), r.pairs[2:end])
+            @assert all(pair -> RFA._same(case.reflection(first(pair)), last(pair)), r.pairs)
+            @assert all(b -> all(isfinite, b), RFA.weights(r))
+        end
+    end
+    result
 end
 
 function run_method(case, method, metadata; grid=nothing, seed_nodes=0)
@@ -208,7 +243,14 @@ function run_method(case, method, metadata; grid=nothing, seed_nodes=0)
     result = fit_schwarz(case, method; points=grid === nothing ? nothing : grid.points)
     elapsed = (time_ns() - start) / 1e9
     rational = get_function(result)
+    extraction_start = time_ns()
     pole, residue = residues(rational)
+    extraction_seconds = (time_ns() - extraction_start) / 1e9
+    length(pole) == length(residue) || error("Pole and residue counts must agree")
+    finite_poles = count(isfinite, pole)
+    nonfinite_poles = length(pole) - finite_poles
+    nonfinite_residues = count(!isfinite, residue)
+    extraction_status = iszero(nonfinite_poles + nonfinite_residues) ? :finite : :nonfinite
     rotation = case.rotation
     pole .*= rotation
     residue .*= abs2(rotation)
@@ -218,7 +260,8 @@ function run_method(case, method, metadata; grid=nothing, seed_nodes=0)
     stop = status(result)
     grid === nothing || record_discrete_run!(metadata, case.slug, method, result, grid,
         seed_nodes, length(audit))
-    (; pole, residue, error, elapsed, rational_degrees, failed=false,
+    (; pole, residue, error, elapsed, extraction_seconds, extraction_status,
+        finite_poles, nonfinite_poles, nonfinite_residues, rational_degrees, failed=false,
         selected_nodes=length(nodes(rational)), recorded=length(result.history),
         returned_record=stop.best, sampled_error=stop.error, stop_reason=stop.reason)
 end
@@ -245,7 +288,9 @@ function run_case(case, metadata)
         catch exception
             rows[method] = (
                 pole=ComplexF64[], residue=ComplexF64[],
-                error=NaN, elapsed=NaN, rational_degrees=(-1, -1), failed=true,
+                error=NaN, elapsed=NaN, extraction_seconds=NaN, extraction_status=:failed,
+                finite_poles=0, nonfinite_poles=0, nonfinite_residues=0,
+                rational_degrees=(-1, -1), failed=true,
                 selected_nodes=0, recorded=0, returned_record=0,
                 sampled_error=NaN, stop_reason=:failed)
             println("failed: ", exception)

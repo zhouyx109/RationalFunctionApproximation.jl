@@ -8,6 +8,14 @@ const EXPERIMENT_PARAMETERS = (
         initial_refinement=15, refinement=4, stagnation=50),
 )
 const AAA_LOEWNER_TOL = 100eps(T)
+# Fixed startup locations in normalized fitting-curve coordinates.
+const QTCF_START_PARAMETERS = Dict(
+    "real" => 0.5, "imaginary" => 0.5,
+    "ellipse_1_025" => 0.5, "ellipse_1_05" => 0.5,
+    "upper_ellipse_1_05" => 0.5, "five_lobed" => 0.25,
+    "smooth_s" => 0.5, "two_semicircle_s" => 0.5,
+    "superellipse_6" => 0.5, "analytic_inlet" => 0.5,
+)
 
 function experiment_parameters(family, method; discrete=false)
     p = EXPERIMENT_PARAMETERS[family]

@@ -6,7 +6,7 @@
 #
 # `_QTCFBlocks` stores blocks; `QuadraticThiele` uses Thiele storage for singletons.
 # `nodes`, `values`, `degrees`, and `degree` support RFA results and display.
-# `convert` changes precision; `copy` saves snapshots; `isreal` checks coefficients.
+# `convert` retains Float64 storage; `copy` saves snapshots; `isreal` checks coefficients.
 # `getproperty` builds continuants for degree and reality queries.
 
 # %%
@@ -37,22 +37,27 @@ vectors, one per block. Singleton storage delegates to Thiele. Continuants are l
 mutable struct QuadraticThiele{T,S} <: AbstractRationalInterpolant{T,S}
     data::Union{Thiele{T,S},_QTCFBlocks{S}}
     polynomials::Union{Nothing,Tuple{Vector{S},Vector{S}}}
+
+    function QuadraticThiele{T,S}(data, polynomials) where {T,S}
+        T === Float64 && S in (Float64, ComplexF64) ||
+            throw(ArgumentError("QTCF uses Float64 or ComplexF64 storage"))
+        return new{T,S}(data, polynomials)
+    end
 end
 
-# %% Base.convert — numeric precision
-"""
-    convert(F, r::QuadraticThiele)
+# Construct from Float64 scalar or block storage.
+QuadraticThiele(data::Union{Thiele{Float64,S},_QTCFBlocks{S}}, polynomials) where {S} =
+    QuadraticThiele{Float64,S}(data, polynomials)
 
-Convert the QTCF coefficients and data to floating-point type `F`, preserving
-whether the representation is real or complex.
+# %% Base.convert
+"""
+    convert(Float64, r::QuadraticThiele)
+
+Copy a QTCF with Float64 or ComplexF64 storage.
 """
 function Base.convert(::Type{F}, r::QuadraticThiele{T,S}) where {F<:AbstractFloat,T,S}
-    V = S <: Complex ? Complex{F} : F
-    d, p = getfield(r, :data), getfield(r, :polynomials)
-    data = d isa Thiele ? convert(F, d) : _QTCFBlocks{V}(
-        Tuple{V,V}.(d.pairs), [V.(b) for b in d.bpolys], [V.(a) for a in d.apolys],
-        V.(d.nodes), V.(d.vals))
-    return QuadraticThiele{F,V}(data, p === nothing ? nothing : (V.(p[1]), V.(p[2])))
+    F === Float64 || throw(ArgumentError("QTCF supports only Float64 precision"))
+    return copy(r)
 end
 
 # %% nodes
@@ -153,6 +158,8 @@ OneDiv retries Classic at a zero denominator; scalar evaluation guards underflow
 At a selected common zero, evaluate after canceling its simple common factor.
 """
 function evaluate(r::QuadraticThiele, z::Number, method::ThieleMethod=default_eval_method())
+    z = z isa Union{AbstractFloat,Integer,Rational} ? Float64(z) :
+        z isa Complex && real(z) isa Union{AbstractFloat,Integer,Rational} ? ComplexF64(z) : z
     d = getfield(r, :data)
     d isa Thiele && !isempty(d.weights) && !isfinite(z) &&
         return convert(promote_type(eltype(r), typeof(z)), evaluate(d, z, method))
@@ -186,7 +193,8 @@ end
 # %% evaluate — array
 # Evaluate an array of points into a promoted output array.
 function evaluate(r::QuadraticThiele, z::AbstractArray{<:Number}, method::ThieleMethod=default_eval_method())
-    t = similar(z, promote_type(eltype(r), eltype(z)))
+    S = eltype(r) <: Real && eltype(z) <: Real ? Float64 : ComplexF64
+    t = similar(z, S)
     return evaluate!(t, r, z, method)
 end
 
@@ -216,7 +224,11 @@ function evaluate!(
     (Base.mightalias(a, b) || Base.mightalias(a, t) || Base.mightalias(b, t) ||
         Base.mightalias(a, z) || Base.mightalias(b, z)) &&
         throw(ArgumentError("evaluation scratch arrays must not overlap each other, the input, or the output"))
+    all(eltype(v) in (Float64, ComplexF64) for v in (t, a, b)) ||
+        throw(ArgumentError("QTCF evaluation buffers must use Float64 or ComplexF64"))
     source = Base.mightalias(t, z) ? copy(z) : z
+    V = eltype(r) <: Real && eltype(z) <: Real ? Float64 : ComplexF64
+    eltype(source) === V || (source = V.(source))
 
     # Singleton storage uses the scalar TCF kernels.
     d, S = getfield(r, :data), promote_type(eltype(r), eltype(source))
@@ -380,7 +392,7 @@ end
 function _derivative!(
     z, r::QuadraticThiele, order::Integer,
     A::AbstractVector, B::AbstractVector, vals::AbstractVector;
-    underflow_guard=true, quotient=true
+    underflow_guard=true, overflow_guard=false, quotient=true
     )
     order >= 0 || throw(ArgumentError("derivative order must be nonnegative"))
     n = order + 1
@@ -406,6 +418,12 @@ function _derivative!(
         end
 
         for k in m-1:-1:1
+            # Rescale all value and derivative entries together before multiplication.
+            if overflow_guard && max(maximum(abs, view(A, 1:n)),
+                    maximum(abs, view(B, 1:n))) > 1e100
+                view(A, 1:n) .*= 1e-100
+                view(B, 1:n) .*= 1e-100
+            end
             block = d.bpolys[k]
             bjet = _evaluate_block_derivs(block, d.pairs[k], z)
             a = k > 1 ? d.apolys[k-1] : nothing
@@ -445,12 +463,12 @@ function _derivative!(
 end
 
 # %% _evaluate_numden_derivs
-# Return unscaled P, Q, P', Q', reusing scratch when supplied.
-function _evaluate_numden_derivs(r::QuadraticThiele, z::Number, space=nothing)
+# Return P, Q, P', Q', optionally rescaling them together against overflow.
+function _evaluate_numden_derivs(r::QuadraticThiele, z::Number, space=nothing; rescale=false)
     S = promote_type(eltype(r), typeof(z))
     A, B = space === nothing ?
         ntuple(_ -> Vector{promote_type(ComplexF64, S)}(undef, 2), 2) : space
-    _derivative!(z, r, 1, A, B, A; underflow_guard=false, quotient=false)
+    _derivative!(z, r, 1, A, B, A; underflow_guard=false, overflow_guard=rescale, quotient=false)
     return S(A[1]), S(B[1]), S(A[2]), S(B[2])
 end
 
@@ -461,6 +479,7 @@ end
 
 Return an evaluator for the requested nonnegative derivative order(s).
 Scalar storage uses Thiele's implementation; block derivatives use one reciprocal.
+The unreduced denominator must be nonzero at the evaluation point.
 """
 function derivative(r::QuadraticThiele, order::Integer=1)
     f = derivative(r, [order])
@@ -473,9 +492,15 @@ function derivative(r::QuadraticThiele, orders::AbstractVector{<:Integer})
     isempty(orders) && throw(ArgumentError("at least one derivative order is required"))
     minimum(orders) >= 0 || throw(ArgumentError("derivative orders must be nonnegative"))
     d = getfield(r, :data)
-    d isa Thiele && return derivative(d, orders)
+    if d isa Thiele
+        f = derivative(d, orders)
+        return z -> f(z isa Union{AbstractFloat,Integer,Rational} ? Float64(z) :
+            z isa Complex && real(z) isa Union{AbstractFloat,Integer,Rational} ? ComplexF64(z) : z)
+    end
     order, index = maximum(orders), 1 .+ orders
     return function(z)
+        z = z isa Union{AbstractFloat,Integer,Rational} ? Float64(z) :
+            z isa Complex && real(z) isa Union{AbstractFloat,Integer,Rational} ? ComplexF64(z) : z
         S = promote_type(eltype(r), typeof(z))
         A, B, vals = ntuple(_ -> Vector{S}(undef, order + 1), 3)
         _derivative!(z, r, order, A, B, vals)
@@ -488,6 +513,7 @@ end
 #
 # `roots` assembles an unreduced numerator or denominator pencil; `poles` cancels
 # exact selected-node common factors from the denominator eigenvalues.
+# `_qtcf_multiple_poles`: multiple-pole detection and computation.
 # `residues` reuses RFA's residue loop and contour fallback with `_evaluate_numden_derivs`.
 # `convert(PartialFractions, r)` combines these with the polynomial part.
 
@@ -618,8 +644,6 @@ function _qtcf_pole_data(r::QuadraticThiele)
         end
         push!(orders, something(findfirst(!iszero, Q), length(Q) + 1) - 1)
     end
-    isempty(common) && return ζ, common
-
     # The exact factor test determines the multiplicity removed. In particular,
     # a close genuine pole is retained; proximity alone never cancels a pole.
     for z in common
@@ -633,7 +657,93 @@ function _qtcf_pole_data(r::QuadraticThiele)
         ζ[available[j]] = z
         deleteat!(available, j)
     end
-    return ζ, common
+    return _qtcf_multiple_poles(ζ, b, pairs, leading, apolys, common), common
+end
+
+# %% _qtcf_multiple_poles
+# Multiple-pole detection and computation.
+function _qtcf_multiple_poles(ζ, blocks, points, leading, apolys, common)
+    prime = 65537
+    trim(p) = resize!(p, something(findlast(!iszero, p), 1))
+    image_real(x) = mod(Int(mod(numerator(x), prime)) *
+        invmod(Int(mod(denominator(x), prime)), prime), prime)
+    image(x) = mod(image_real(real(x)) + 256image_real(imag(x)), prime)
+    function continuant(b, z, c, reduce)
+        Q, previous = [one(first(c))], [zero(first(c))]
+        for k in 2:length(b)
+            a = length(apolys[k-1]) == 2 ? [-z[k-1][1], one(first(c))] :
+                [z[k-1][1] * z[k-1][2], -sum(z[k-1]), one(first(c))]
+            Q, previous = trim(reduce.(_padd(_pmul(b[k], Q),
+                _pmul(reduce.(c[k-1] .* a), previous)))), Q
+        end
+        return Q
+    end
+    function divide(p, q, reciprocal, reduce)
+        remainder = copy(p)
+        quotient = zeros(eltype(p), max(length(p) - length(q) + 1, 1))
+        while length(remainder) >= length(q) && !all(iszero, remainder)
+            shift = length(remainder) - length(q)
+            coefficient = reduce(last(remainder) * reciprocal(last(q)))
+            quotient[shift+1] = coefficient
+            for k in eachindex(q)
+                remainder[k+shift] = reduce(remainder[k+shift] - coefficient * q[k])
+            end
+            trim(remainder)
+        end
+        return trim(quotient), remainder
+    end
+    function pgcd(p, q, reciprocal, reduce)
+        while !all(iszero, q)
+            p, q = q, last(divide(p, q, reciprocal, reduce))
+        end
+        return trim(reduce.(p .* reciprocal(last(p))))
+    end
+    derivative(p) = [k * p[k+1] for k in 1:length(p)-1]
+    reduce(x) = mod(x, prime)
+    reciprocal(x) = invmod(x, prime)
+    qmod = continuant([image.(b) for b in blocks],
+        [image.(z) for z in points], image.(leading), reduce)
+    bound, previous = 0, -2length(blocks)
+    for k in 2:length(blocks)
+        degree = something(findlast(!iszero, blocks[k]), 0) - 1
+        bound, previous = max(degree + bound, length(apolys[k-1]) - 1 + previous), bound
+    end
+    bound < 2 && return ζ
+    if length(qmod) - 1 == bound
+        length(pgcd(qmod, reduce.(derivative(qmod)), reciprocal, reduce)) == 1 && return ζ
+    end
+
+    Q = continuant(blocks, points, leading, identity)
+    for z in common
+        node = eltype(Q)(z)
+        Q = first(divide(Q, [-node, one(node)], inv, identity))
+    end
+    length(Q) < 3 && return ζ
+    repeated = pgcd(Q, derivative(Q), inv, identity)
+    length(repeated) == 1 && return ζ
+    distinct = first(divide(Q, repeated, inv, identity))
+    result = ComplexF64[]
+    multiplicity = 1
+    while length(distinct) > 1
+        shared = pgcd(distinct, repeated, inv, identity)
+        factor = first(divide(distinct, shared, inv, identity))
+        n = length(factor) - 1
+        if n > 0
+            coefficients = ComplexF64.(factor ./ last(factor))
+            C = zeros(ComplexF64, n, n)
+            for k in 1:n-1
+                C[k+1, k] = 1
+            end
+            C[:, n] .= -coefficients[1:n]
+            for z in eigvals(C), _ in 1:multiplicity
+                push!(result, z)
+            end
+        end
+        distinct = shared
+        repeated = first(divide(repeated, shared, inv, identity))
+        multiplicity += 1
+    end
+    return eltype(ζ) <: Real && all(isreal, result) ? real.(result) : result
 end
 
 # %% residues
@@ -641,23 +751,22 @@ end
     residues(r::QuadraticThiele)
 
 Return `(poles, residues)`, using the numerator/denominator derivative ratio
-with contour integration after cancellation and as a fallback for nonfinite results.
+for simple poles and contour integration for multiple poles or canceled factors.
 """
 function residues(r::QuadraticThiele)
     ζ, common = _qtcf_pole_data(r)
     S = promote_type(ComplexF64, eltype(r), eltype(ζ))
     space = isempty(ζ) ? nothing : ntuple(_ -> Vector{S}(undef, 2), 2)
-    # Splitting a multiple unreduced denominator root can make P/Q' unreliable
-    # even when finite. Contours avoid this after any confirmed cancellation.
-    numden(r, z) = !isempty(common) ?
-        (zero(S), zero(S), zero(S), zero(S)) : _evaluate_numden_derivs(r, z, space)
+    # Multiple-pole detection and computation.
+    function numden(r, z)
+        (!isempty(common) || count(==(z), ζ) > 1) &&
+            return (zero(S), zero(S), zero(S), zero(S))
+        data = _evaluate_numden_derivs(r, z, space)
+        return all(isfinite, data) ? data : _evaluate_numden_derivs(r, z, space; rescale=true)
+    end
     radius(z) = minimum((abs(z - t) / 4 for t in ζ if t != z);
         init=max(one(abs(z)), abs(z)) * 0.25)
-    isempty(common) && return residues(r, ζ; check_finite=true, radius, numden)
-    return setprecision(BigFloat, max(256, precision(real_type(eltype(r))))) do
-        # Wider arithmetic prevents cancellation in evaluations on small contours.
-        residues(convert(BigFloat, r), ζ; check_finite=true, radius, numden)
-    end
+    return residues(r, ζ; check_finite=true, radius, numden)
 end
 
 # %% Base.convert — partial fractions
@@ -712,15 +821,15 @@ end
 # `_block_line` to fit denominator coefficients, and `_factor_poly` for numerators.
 # The same block helpers serve paired `add_node!` updates.
 
-# %% QuadraticThiele — requested precision
+# %% QuadraticThiele{Float64}
 """
-    QuadraticThiele{T}(nodes, values, [weights]; kwargs...)
+    QuadraticThiele{Float64}(nodes, values, [weights]; kwargs...)
 
-Construct a QTCF at floating-point precision `T`, checking converted data.
+Construct a QTCF with Float64 or ComplexF64 data.
 """
 function QuadraticThiele{T}(args...; kwargs...) where {T<:AbstractFloat}
-    original = QuadraticThiele(args...; kwargs...)
-    r = real_type(eltype(original)) === T ? original : convert(T, original)
+    T === Float64 || throw(ArgumentError("QTCF supports only Float64 precision"))
+    r = QuadraticThiele(args...; kwargs...)
 
     # Validate the converted data, since conversion can merge distinct nodes.
     all(isfinite, nodes(r)) || throw(ArgumentError("interpolation nodes must be finite"))
@@ -755,7 +864,7 @@ function QuadraticThiele(
     if isempty(x)
         types = (eltype(x), eltype(y), w === nothing ? eltype(y) : eltype(w))
         types = map(T -> T <: AbstractVector ? eltype(T) : T, types)
-        S = promote_type(map(T -> T <: Number ? float(T) : Float64, types)...)
+        S = any(T -> T <: Complex, types) ? ComplexF64 : Float64
         return QuadraticThiele{real_type(S),S}(Thiele(S[], S[], S[]), nothing)
     end
 
@@ -769,6 +878,7 @@ function QuadraticThiele(
     xx, yy = float.(x), float.(y)
     S = promote_type(eltype(xx), eltype(yy),
         b === nothing ? eltype(xx) : scalar ? eltype(b) : promote_type(map(eltype, b)...))
+    S = S <: Real ? Float64 : ComplexF64
     z, f = convert(Vector{S}, xx), convert(Vector{S}, yy)
 
     # Reject nonfinite or repeated nodes before constructing any blocks.
@@ -935,7 +1045,7 @@ function _new_weight(method::Union{Classic,OneDiv}, r::QuadraticThiele, z_new, y
 end
 
 # %% _block_line
-# Fit constant/affine weights; optionally preserve symmetry and retry overflow.
+# Fit constant/affine weights, optionally preserving symmetry.
 function _block_line(z1, h1, z2, h2; symmetric=true)
     (!isfinite(h1) || !isfinite(h2)) && return [oftype(h1, NaN)]
     _same(z1, z2) && return [h1]
@@ -959,29 +1069,13 @@ function _block_line(z1, h1, z2, h2; symmetric=true)
         [midpoint_value - slope * midpoint, slope]
     end
 
-    all(isfinite, b) && return b
-    S = eltype(b)
-    all(isfinite, (z1, h1, z2, h2)) || return S[NaN]
-
-    # Retry finite data in wider arithmetic when the block calculation overflows.
-    wide = setprecision(BigFloat, max(256, precision(BigFloat))) do
-        if length(b) == 1
-            [(big(h1) + big(h2)) / 2]
-        else
-            wide_slope = (big(h2) - big(h1)) / (big(z2) - big(z1))
-            [(big(h1) + big(h2) - wide_slope * (big(z1) + big(z2))) / 2, wide_slope]
-        end
-    end
-
-    # Wider arithmetic helps only if the coefficients fit the original type.
-    result = S.(wide)
-    return all(isfinite, result) ? result : S[NaN]
+    return all(isfinite, b) ? b : eltype(b)[NaN]
 end
 
 # %% _factor_poly
 # Return linear or quadratic numerator coefficients for the supplied node pair.
 function _factor_poly(z1, z2)
-    S = promote_type(ComplexF64, typeof(z1), typeof(z2))
+    S = ComplexF64
     singleton = _same(z1, z2)
     z1, z2 = S(z1), S(z2)
     return singleton ? S[-z1, 1] : S[z1*z2, -(z1 + z2), 1]
@@ -1208,7 +1302,7 @@ end
 # Return reduced sample values, reusing workspace when supplied.
 function _reduced_values(ztest, ftest, bpolys, apolys, pairs; workspace=nothing)
     # Reuse compatible storage and initialize each value as a homogeneous pair.
-    S = promote_type(ComplexF64, eltype(ztest), eltype(ftest))
+    S = ComplexF64
     hnum, hden = workspace === nothing || eltype(workspace[1]) !== S ?
         (Vector{S}(undef, length(ftest)), Vector{S}(undef, length(ftest))) : workspace
     resize!(hnum, length(ftest))
@@ -1235,8 +1329,7 @@ end
 # Return unique sample points, values, and parameters including their reflections.
 function _reflected_continuum_samples(f::F, d::D, zgrid, fgrid, sgrid, reflection::R) where {F,D,R}
     # Use one spatial lookup for original and reflected samples.
-    S = promote_type(ComplexF64, eltype(zgrid), eltype(fgrid))
-    T = promote_type(typeof(float(sgrid[firstindex(sgrid)])), typeof(float(length(d))))
+    S, T = ComplexF64, Float64
     zout, fout, sout = S[], S[], T[]
     h = 64eps(Float64) * maximum(z -> Float64(abs(z)), S.(zgrid); init=1.0)
     table = Dict{Tuple{Int,Int},Vector{Int}}()
@@ -1295,6 +1388,8 @@ selects the same pole policy as TCF. See [`symmetric`](@ref) for pairing.
 The mesh spans the full parameter interval, but test samples lie inside its
 subintervals, as in TCF. The first block uses `point(domain, 0)` and its distinct
 reflection, when supplied; these selected endpoints are not test samples.
+`initial_node` instead starts at a supplied point on the domain. With a reflection,
+`pairs_only=true` uses the startup point with its reflection, then distinct pairs.
 
 New blocks require finite reduced values and coefficients. Every convergent is
 recorded; error checks include selected nodes, which cannot be selected again.
@@ -1303,7 +1398,7 @@ contains one node and subsequent blocks select the two largest residuals.
 """
 function approximate(
     f::Function, d::ComplexCurveOrPath, ::QuadraticThiele;
-    float_type::Type{F} = promote_type(real_type(d), typeof(float(1))),
+    float_type::Type{Float64} = Float64,
     tol::Real = 1000*eps(float_type),
     allowed = true,
     max_degree::Int = 100,
@@ -1312,8 +1407,12 @@ function approximate(
     initial_refinement::Int = 15,
     stagnation::Int = 5,
     reflection::Union{Nothing,Function} = nothing,
-    value_reflection::Union{Nothing,Function} = nothing
-    ) where {F}
+    value_reflection::Union{Nothing,Function} = nothing,
+    initial_node = nothing,
+    pairs_only::Bool = false
+    )
+
+    tol = Float64(tol)
 
     # Resolve pole and symmetry options.
     if allowed == :strict
@@ -1322,11 +1421,17 @@ function approximate(
     end
     reflection === nothing && value_reflection !== nothing && throw(ArgumentError(
         "value_reflection requires a reflection map"))
+    pairs_only && reflection === nothing && throw(ArgumentError(
+        "pairs_only requires a reflection map"))
 
     # Initialize the mesh and reusable construction storage.
     paired = reflection !== nothing
-    Tpar, S = typeof(float(length(d))), complex(float_type)
+    Tpar, S = Float64, ComplexF64
     L = Tpar(length(d))
+    initial_node === nothing || isfinite(initial_node) || throw(ArgumentError(
+        "initial_node must be finite"))
+    start = initial_node === nothing ? zero(Tpar) :
+        _reflection_param(d, zero(Tpar), _ -> initial_node)
     num_ref = max(refinement, initial_refinement)
     # Start with [0, 1] on a curve; multi-curve paths use their full native interval.
     s_nodes = Tpar[zero(Tpar), L]
@@ -1344,8 +1449,7 @@ function approximate(
     end
 
     ztest, ftest, stest = paired ? sample_path() : (S[], S[], Tpar[])
-    R = promote_type(ComplexF64, eltype(ztest), eltype(ftest))
-    reduced_workspace = (R[], R[])
+    reduced_workspace = (S[], S[])
     fmax = paired ? maximum(abs, ftest) : zero(float_type)
     active_h = 64eps(Float64) * maximum(z -> Float64(abs(z)),
         paired ? ztest : S[point(d, zero(Tpar)), point(d, L)]; init=1.0)
@@ -1358,7 +1462,6 @@ function approximate(
     # Check value symmetry and detect equal values at reflected points.
     if paired
         equality, scale, probes = 0.0, 1.0, 0
-        V = promote_type(ComplexF64, S)
         for sprobe in stest
             zprobe = S(point(d, _clean_param(d, sprobe)))
             zrprobe = S(reflection(zprobe))
@@ -1371,7 +1474,7 @@ function approximate(
                 yrprobe = mapped
             end
             _same(zprobe, zrprobe) && continue
-            y, yr = V(yprobe), V(yrprobe)
+            y, yr = yprobe, yrprobe
             scale = max(scale, abs(y), abs(yr))
             equality = max(equality, abs(yr - y))
             probes += 1
@@ -1392,6 +1495,7 @@ function approximate(
         # Reject reuse of either node, including coincident curve endpoints.
         any(z -> _same(z, z1) || _same(z, z2), zact) && return false
         fixed = _same(z1, z2)
+        pairs_only && !isempty(bpolys) && fixed && return false
 
         # Evaluate and reduce the data before constructing the block.
         y1 = S(f(z1))
@@ -1433,13 +1537,12 @@ function approximate(
 
         # Refine at both parameters.
         paired || (fmax = max(fmax, abs(y1), abs(y2)))
-        Tmesh = paired ? typeof(s1) : promote_type(eltype(s_nodes), typeof(s1), typeof(s2))
-        s_nodes = _mesh_params(d, s_nodes, (s1, s2), Tmesh)
+        s_nodes = _mesh_params(d, s_nodes, (s1, s2), Tpar)
         return true
     end
 
     # Initialize rational approximation and history.
-    accept_block!(zero(Tpar)) || error("Initial QTCF continuum node was not admissible.")
+    accept_block!(start) || error("Initial QTCF continuum node was not admissible.")
     r = _qtcf_from_blocks(pairs, bpolys, apolys, zact, yact)
     history = [IterationRecord(r, NaN, missing)]
     best_err, stop_reason = Inf, :max_degree
@@ -1464,9 +1567,10 @@ function approximate(
         end
         err_max = max(maximum(err; init=0.0), node_error)
 
-        # Selected nodes contribute to the error, but cannot enter another block.
+        # Assess all samples before excluding selected nodes and fixed-point candidates.
         for k in eachindex(ztest)
-            _lookup_node_index(active_table, zact, paired ? ztest[k] : S(ztest[k]), active_h) !== nothing &&
+            (_lookup_node_index(active_table, zact, paired ? ztest[k] : S(ztest[k]), active_h) !== nothing ||
+                (pairs_only && _same(ztest[k], reflection(ztest[k])))) &&
                 (err[k] = -Inf)
         end
 
@@ -1488,7 +1592,7 @@ function approximate(
             break
         end
 
-        # Attempt the highest-scoring node with its prescribed or greedy partner.
+        # Attempt the largest-error node with its prescribed or greedy partner.
         accepted = false
         _, i = findmax(err)
         if err[i] != -Inf
@@ -1539,37 +1643,39 @@ Fit sampled values `y` on the grid `z` with quadratic Thiele blocks.
 the two largest residuals select each new pair. Minimum magnitudes tied to rounding
 prefer a fixed point of the supplied reflection at startup. `max_iter` counts blocks. The stopping
 error is relative to the sampled target scale.
+`initial_node` instead selects a supplied grid point. With a reflection,
+`pairs_only=true` uses the startup point with its reflection, then distinct pairs.
 Every convergent is recorded. Error checks use the whole grid, including selected
 nodes; only unselected nodes are eligible for the next block.
-For equal-value symmetry, alternating stages use the preceding paired error
-to guide selection.
 Use [`symmetric`](@ref) to declare point and function-value symmetry.
 """
 function approximate(
     y::AbstractVector{T}, z::AbstractVector{Z}, ::QuadraticThiele;
-    float_type::Type{F} = promote_type(real_type(eltype(z)), typeof(float(1))),
+    float_type::Type{Float64} = Float64,
     tol::Real = 1000*eps(float_type),
     allowed::Union{Function,Bool} = true,
     max_iter::Int = length(y),
     stagnation::Int = 5,
-    reflection::Union{Nothing,Function} = nothing
-    ) where {T<:Number,Z<:Number,F}
+    reflection::Union{Nothing,Function} = nothing,
+    initial_node = nothing,
+    pairs_only::Bool = false
+    ) where {T<:Number,Z<:Number}
 
     # Choose the scalar TCF startup node, preferring a fixed point in rounding ties.
-    smallest, idx_min = findmin(abs, y)
-    zgrid, fgrid = z, y
+    S = ComplexF64
+    zgrid, fgrid = S.(z), S.(y)
+    smallest, idx_min = findmin(abs, fgrid)
     tol = convert(float_type, tol)
     paired = reflection !== nothing
-    if paired && isfinite(smallest) && z[idx_min] != reflection(z[idx_min])
-        fixed = findfirst(eachindex(z)) do i
-            abs(y[i]) - smallest <= 4eps(float(smallest)) && z[i] == reflection(z[i])
+    pairs_only && !paired && throw(ArgumentError("pairs_only requires a reflection map"))
+    if paired && isfinite(smallest) && zgrid[idx_min] != reflection(zgrid[idx_min])
+        fixed = findfirst(eachindex(zgrid)) do i
+            abs(fgrid[i]) - smallest <= 4eps(smallest) && zgrid[i] == reflection(zgrid[i])
         end
         idx_min = something(fixed, idx_min)
     end
 
     # Build the node lookup and locate each reflected partner.
-    S = complex(float_type)
-    zgrid, fgrid = S.(zgrid), S.(fgrid)
     used = zeros(Int, length(zgrid))
     hash_step = 64eps(Float64) * maximum(z -> Float64(abs(z)), zgrid; init=1.0)
     table = Dict{Tuple{Int,Int},Vector{Int}}()
@@ -1580,6 +1686,11 @@ function approximate(
         reflection(z), hash_step), 0) for z in zgrid] : Int[]
     any(iszero, partner) && throw(ArgumentError(
         "Each reflected point must be present in the discrete grid."))
+    initial_node === nothing || isfinite(initial_node) || throw(ArgumentError(
+        "initial_node must be finite"))
+    seed = initial_node === nothing ? idx_min :
+        _lookup_node_index(table, zgrid, S(initial_node), hash_step)
+    seed === nothing && throw(ArgumentError("initial_node must be present in the discrete grid"))
 
     # Initialize the stopping threshold, blocks, and reduced-data buffers.
     fmax = maximum(abs, fgrid)
@@ -1587,7 +1698,6 @@ function approximate(
     pairs = Tuple{S,S}[]
     bpolys, apolys, zact, yact = Vector{S}[], Vector{S}[], S[], S[]
     hnum, hden = copy(fgrid), ones(S, length(fgrid))
-    reference_error = float_type[]
     value_mode = :generic
     if paired
         for i in eachindex(zgrid)
@@ -1605,6 +1715,7 @@ function approximate(
     # Try a block at grid indices i and j.
     function accept_pair!(i, j)
         (iszero(used[i]) && iszero(used[j])) || return false
+        pairs_only && !isempty(bpolys) && _same(zgrid[i], zgrid[j]) && return false
 
         # Read target and reduced values at both grid points.
         z1, y1, h1 = zgrid[i], fgrid[i], isempty(bpolys) ? fgrid[i] : _qtcf_ratio(hnum[i], hden[i])
@@ -1641,10 +1752,9 @@ function approximate(
         return true
     end
 
-    # Start at the point of minimum target magnitude.
-    seed = idx_min
+    # Start at the supplied node or the point of minimum target magnitude.
     accept_pair!(seed, paired ? partner[seed] : seed) ||
-        error("Initial QTCF node matching the scalar TCF start was not admissible.")
+        error("Initial QTCF discrete node was not admissible.")
 
     # Initialize rational approximation and history; retain node-selection marks.
     r = _qtcf_from_blocks(pairs, bpolys, apolys, zact, yact)
@@ -1660,14 +1770,13 @@ function approximate(
             !iszero(used[i]) && !isfinite(err[i]) ? Inf : err[i]
         end
         err .= ifelse.(iszero.(used), err, -Inf)
+        if pairs_only
+            for i in eachindex(err)
+                _same(zgrid[i], reflection(zgrid[i])) && (err[i] = -Inf)
+            end
+        end
         blocks = length(bpolys)
         push!(history, IterationRecord(r, err_max, missing))
-        paired_stage = value_mode !== :equality || parity_fixed_index == 0 ||
-            blocks <= parity_fixed_index || iseven(blocks - parity_fixed_index)
-        if paired_stage && value_mode === :equality && parity_fixed_index > 0
-            resize!(reference_error, length(err))
-            copyto!(reference_error, err)
-        end
         if isfinite(err_max) && err_max < best_err
             err_max < 0.999 * best_err && (last_improve = blocks)
             best_err = err_max
@@ -1682,22 +1791,14 @@ function approximate(
         end
         blocks < max_iter && !_qtcf_converged(history[end], stop_tol, allowed) || break
 
-        # Combine current and preceding paired errors between paired stages.
-        score = err
-        if !paired_stage
-            score = ifelse.(isfinite.(err) .& isfinite.(reference_error),
-                sqrt.(max.(err, 0)) .* sqrt.(max.(reference_error, 0)), err)
-            iszero(maximum(score; init=zero(float_type))) && (score = err)
-        end
-
-        # Attempt the highest-scoring block and update the approximant.
+        # Attempt the largest-error block and update the approximant.
         accepted = false
-        _, i = findmax(score)
-        if score[i] != -Inf
+        _, i = findmax(err)
+        if err[i] != -Inf
             if paired
                 accepted = accept_pair!(i, partner[i])
             else
-                second = copy(score)
+                second = copy(err)
                 for k in eachindex(second)
                     _same(zgrid[k], zgrid[i]) && (second[k] = -Inf)
                 end
@@ -1805,6 +1906,7 @@ end
 # %% Base.:+
 # Return r + s, shifting the first block and stored target values.
 function Base.:+(r::QuadraticThiele, s::Number)
+    s = s isa Real ? Float64(s) : ComplexF64(s)
     d = getfield(r, :data)
     d isa Thiele && return QuadraticThiele(d + s, nothing)
 
@@ -1824,6 +1926,7 @@ end
 # %% Base.:*
 # Return r * s, scaling alternate denominator blocks by s and its reciprocal.
 function Base.:*(r::QuadraticThiele, s::Number)
+    s = s isa Real ? Float64(s) : ComplexF64(s)
     d = getfield(r, :data)
     d isa Thiele && return QuadraticThiele(d * s, nothing)
     S = promote_type(eltype(r), typeof(s))
