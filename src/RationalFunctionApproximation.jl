@@ -60,6 +60,16 @@ end
 export convergenceplot, convergenceplot!, errorplot, errorplot!, animate, poleplot, poleplot!
 
 # COV_EXCL_START
+function _plot_extension()
+    @static if isdefined(Base, :get_extension)
+        for name in (:RFAMakieExt, :RFAPlotsExt)
+            extension = Base.get_extension(@__MODULE__, name)
+            isnothing(extension) || return extension
+        end
+    end
+    error("Load the Makie or Plots package first.")
+end
+
 function animate(::Any)
     error("Load the Makie or Plots package first.")
 end
@@ -74,6 +84,9 @@ Markers show the maximum error on (the boundary of) the domain as a function of 
 function convergenceplot(::Any)
     error("Load the Makie or Plots package first.")
 end
+
+convergenceplot(r::AbstractApproximation; kwargs...) =
+    _plot_extension().plot_convergence(r; kwargs...)
 
 function convergenceplot!(::Any)
     error("Load the Makie or Plots package first.")
@@ -98,8 +111,11 @@ end
 Plot the poles of the rational approximant.
 """
 function poleplot(::Any; kwargs...)
-    error("Load the Makie package first.")
+    error("Load the Makie or Plots package first.")
 end
+
+poleplot(r::AbstractApproximation; kwargs...) =
+    _plot_extension().plot_poles(r; kwargs...)
 
 function poleplot!(::Any; kwargs...)
     error("Load the Makie package first.")

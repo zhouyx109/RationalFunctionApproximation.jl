@@ -133,14 +133,26 @@ function approximate(
     return DiscreteApproximation(y, z, r, trues(length(y)), true, nothing)
 end
 
-function Base.convert(::Type{PartialFractions}, r::Union{Barycentric, Thiele})
+Base.convert(::Type{PartialFractions}, r::Union{Barycentric, Thiele}) = _partial_fractions(r)
+
+_polynomial_degree(r::AbstractRationalInterpolant) = first(degrees(r))
+
+function _partial_fractions(r::AbstractRationalInterpolant)
     zp, res = residues(r)
     m, n = degrees(r)
     d = m - n    # degree of the polynomial part
-    if d >= 0
-        z = first(roots(r), d + 1)
-        pf(x) = -sum(res[i] / (x - zp[i]) for i in eachindex(zp))
-        p = ArnoldiBasis(z, d) \ pf
+    if isempty(zp)
+        d = _polynomial_degree(r)
+        p = ArnoldiBasis(first(unique(nodes(r)), d + 1), d) \ r
+    elseif d >= 0
+        z = unique(roots(r))
+        pf(x) = sum(res[i] / (x - zp[i]) for i in eachindex(zp))
+        if length(z) >= d + 1
+            p = ArnoldiBasis(first(z, d + 1), d) \ (x -> -pf(x))
+        else
+            z = [x for x in unique(nodes(r)) if x ∉ zp && isfinite(r(x))]
+            p = ArnoldiBasis(z, d) \ (x -> r(x) - pf(x))
+        end
     else
         p = ArnoldiPolynomial([0], ArnoldiBasis([1], 0))
     end

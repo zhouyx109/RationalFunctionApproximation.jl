@@ -1,34 +1,38 @@
 module RFAPlotsExt
 
 using RationalFunctionApproximation, ComplexRegions, Plots
-RFA = RationalFunctionApproximation
 
 # Plot a convergence curve, showing which steps had bad poles
-function RFA.convergenceplot(r::RFA.AbstractApproximation)
+function plot_convergence(r::RFA.AbstractApproximation)
     deg, err, _, allowed, best = get_history(r)
-    fig = plot(xlabel="degree", ylabel="max relative error", yscale=:log10, legend=false)
+    fig = plot(xlabel="degree", ylabel="max error", yscale=:log10, legend=false)
     seriescolor = [ all(b) ? :darkblue : :red for b in allowed]
-    scatter!([deg[best]], [err[best]],
+    scatter!(fig, [deg[best]], [err[best]],
         markercolor=RGBA(1,1,1,0), markerstrokecolor=:gold, msw=5, markersize=7 )
-    scatter!(deg, err; seriescolor, msw=0, markersize=5)
+    scatter!(fig, deg, err; seriescolor, msw=0, markersize=5)
     return fig
 end
 
 function RFA.errorplot(r::RFA.AbstractApproximation; use_abs=false)
-    fig = plot(xlabel="boundary parameter", ylabel="error", legend=false)
-    # try to get enough points for a smooth result
-    N = ceil(Int, 1000 / length(nodes(r)))
-    t, τ, err = check(r, refinement=N, quiet=true, prenodes=true)
-    if use_abs
-        plot!(t, abs.(err))
-        ylabel!("| error |")
-    elseif isreal(err)
-        plot!(t, err)
-        ylabel!("error")
+    if r isa RFA.DiscreteApproximation
+        _, err = check(r; quiet=true)
+        t = findall(r.test_index)
+        xlabel = "sample index"
     else
-        plot!(t, real.(err))
-        plot!(t, imag.(err))
-        ylabel!("Re, Im error")
+        N = cld(1000, max(1, length(nodes(r))))
+        t, _, err = check(r; refinement=N, quiet=true, prenodes=true)
+        xlabel = "boundary parameter"
+    end
+    fig = plot(; xlabel, ylabel="error", legend=false)
+    if use_abs
+        plot!(fig, t, abs.(err))
+        ylabel!(fig, "| error |")
+    elseif isreal(err)
+        plot!(fig, t, real.(err))
+    else
+        plot!(fig, t, real.(err))
+        plot!(fig, t, imag.(err))
+        ylabel!(fig, "Re, Im error")
     end
     return fig
 end
@@ -42,17 +46,23 @@ function axisbox(z)
     return xbox, ybox
 end
 
-function RFA.poleplot(r::RFA.AbstractApproximation, idx::Integer=0)
+plot_poles(r::RFA.AbstractApproximation) = RFA.poleplot(r, 0)
+
+function RFA.poleplot(r::RFA.AbstractApproximation, idx::Integer)
     fig = plot(xlabel="Re(z)", ylabel="Im(z)", aspect_ratio=1, legend=false)
-    z, _ = check(r, quiet=true)
-    z = [z; z[1]]
-    plot!(real(z), imag(z))
+    z = test_points(r; include_selected=true)
+    if r isa RFA.DiscreteApproximation
+        scatter!(fig, real(z), imag(z); markersize=2)
+    else
+        RFA.isclosed(domain(r)) && (z = [z; first(z)])
+        plot!(fig, real(z), imag(z))
+    end
     zp = iszero(idx) ? RFA.poles(r) : RFA.poles(rewind(r, idx))
-    color = [r.allowed(z) ? :black : :red for z in zp]
-    scatter!(real(zp), imag(zp); color, markersize=4)
+    color = [RFA._pole_allowed(r.allowed, z) ? :black : :red for z in zp]
+    scatter!(fig, real(zp), imag(zp); color, markersize=4)
     xbox, ybox = axisbox(z)
-    xlims!(xbox...)
-    ylims!(ybox...)
+    xlims!(fig, xbox...)
+    ylims!(fig, ybox...)
     return fig
 end
 

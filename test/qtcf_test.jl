@@ -1,8 +1,9 @@
 using RationalFunctionApproximation, ComplexRegions, CairoMakie, LaTeXStrings
 using Logging, Printf, LinearAlgebra
 
-isdefined(RFA, :QuadraticThiele) || error(
-    "These experiments require the local QTCF extension. Run this file with --project=test from this checkout.")
+local_source = joinpath(@__DIR__, "..", "src", "RationalFunctionApproximation.jl")
+realpath(pathof(RFA)) == realpath(local_source) || error(
+    "These experiments require the local RFA package. Run this file with --project=test from this checkout.")
 
 const EXPERIMENT_MODE = isdefined(@__MODULE__, :QTCF_EXPERIMENT_MODE) ?
     QTCF_EXPERIMENT_MODE : :continuum
@@ -12,7 +13,8 @@ include("qtcf_parameters.jl")
 
 # Interval data and independent validation points.
 fine = T(2) .^ ABS_LOG_EXPONENTS
-abs_check = sort!(unique(vcat(range(-one(T), one(T), ABS_UNIFORM_N),
+abs_check = sort!(unique(vcat([-one(T) + T(2)*k/(ABS_UNIFORM_N-1)
+        for k in 0:ABS_UNIFORM_N-1],
     fine, -fine, fine .- one(T))))
 interval_cases = (
     (slug="real", name="|x| on [-1,1]", title=raw"$|x|$ on $[-1,1]$",
@@ -22,11 +24,21 @@ interval_cases = (
 )
 
 # Curves and their analytic derivatives.
+function paper_closed_curve(args...)
+    curve = Curve(args...)
+    point(curve, 0) == point(curve, 1) || error("Curve endpoints must agree exactly")
+    return ComplexRegions._closedcurve(curve)
+end
+
+paper_ellipse(a, b) = paper_closed_curve(
+    t -> a*cospi(2t) + b*im*sinpi(2t),
+    t -> 2pi*(-a*sinpi(2t) + b*im*cospi(2t)))
+
 paper_upper_ellipse = Curve(t -> cospi(1-t) + 0.5im*sinpi(1-t),
     t -> pi*sinpi(1-t) - 0.5im*pi*cospi(1-t), 0, 1)
-paper_lobed_full = ClosedCurve(
+paper_lobed_full = paper_closed_curve(
     t -> (1 + 0.2sinpi(5*(t/pi)))*cispi(t/pi),
-    t -> cispi(t/pi)*(cospi(5*(t/pi)) + im*(1 + 0.2sinpi(5*(t/pi)))), 0, 2pi)
+    t -> cispi(t/pi)*(cospi(5*(t/pi)) + im*(1 + 0.2sinpi(5*(t/pi)))), -pi/2, 3pi/2)
 paper_smooth_s_curve = Curve(t -> -0.75sinpi(2t) + im*(2-4t),
     t -> -1.5pi*cospi(2t) - 4im, 0, 1)
 paper_semicircle_s_curve = Curve(
@@ -44,17 +56,17 @@ function super6_deriv(t)
     2pi*cispi(2t)*(g^(-7/6)*(s*c^5-c*s^5) + im*g^(-1/6))
 end
 
-paper_superellipse6 = ClosedCurve(super6_point, super6_deriv, 0, 1)
-paper_inlet = ClosedCurve(
+paper_superellipse6 = paper_closed_curve(super6_point, super6_deriv, 0, 1)
+paper_inlet = paper_closed_curve(
     t -> INLET_OFFSET + sum(INLET_COS[k]*cospi(k*t/pi) + im*INLET_SIN[k]*sinpi(k*t/pi)
         for k in eachindex(INLET_COS)),
     t -> sum(-k*INLET_COS[k]*sinpi(k*t/pi) + im*k*INLET_SIN[k]*cospi(k*t/pi)
         for k in eachindex(INLET_COS)), 0, 2pi)
 
 qtcf_cases = map((
-    ("ellipse_1_025", "ellipse (1, 1/4) Schwarz", Shapes.ellipse(1, 0.25), conj,
+    ("ellipse_1_025", "ellipse (1, 1/4) Schwarz", paper_ellipse(1, 0.25), conj,
         raw"$z(t)=\cos t+\frac{i}{4}\sin t$", 1.0+0.0im),
-    ("ellipse_1_05", "ellipse (1, 1/2) Schwarz", Shapes.ellipse(1, 0.5), conj,
+    ("ellipse_1_05", "ellipse (1, 1/2) Schwarz", paper_ellipse(1, 0.5), conj,
         raw"$z(t)=\cos t+\frac{i}{2}\sin t$", 1.0+0.0im),
     ("upper_ellipse_1_05", "upper ellipse (1, 1/2) Schwarz", paper_upper_ellipse, conj,
         raw"$z(t)=\cos(\pi(1-t))+\frac{i}{2}\sin(\pi(1-t))$", 1im),
@@ -69,7 +81,7 @@ qtcf_cases = map((
     ("analytic_inlet", "analytic right inlet Schwarz", paper_inlet, conj,
         raw"$z(t)=0.1-0.1\cos t-0.7\cos2t-0.1\cos3t-i(0.8\sin t+0.4\sin2t+0.2\sin3t)$", 1.0+0.0im),
 )) do (slug, name, domain, reflection, formula, rotation)
-    constructor = RFA.isclosed(domain) ? ClosedCurve : Curve
+    constructor = RFA.isclosed(domain) ? paper_closed_curve : Curve
     fit_domain = rotation == 1 ? domain : constructor(
         t -> point(domain, t)/rotation,
         t -> ComplexRegions.tangent(domain, t)/rotation, 0, 1)
@@ -78,24 +90,58 @@ end
 
 include("qtcf_output.jl")
 
-# Recurrence selectors must be defined before the numerical calls are compiled.
-set_eval_method(OneDiv())
-set_weight_method(OneDiv())
+# The scalar TCF interface reads its recurrence selectors at fit time.
+set_eval_method(EXPERIMENT_EVAL_METHOD)
+set_weight_method(EXPERIMENT_WEIGHT_METHODS.TCF)
+
+function fit_experiment(f, domain, method; kwargs...)
+    if method === :QTCF
+        return approximate(f, domain, QTCF(); weight_method=EXPERIMENT_WEIGHT_METHODS.QTCF,
+            eval_method=EXPERIMENT_EVAL_METHOD, kwargs...)
+    end
+    return approximate(f, domain, method === :AAA ? AAA() : TCF(); kwargs...)
+end
+
+# Use the same parameter-midpoint startup in both sampling modes.
+qtcf_startup(domain) = (; initial_node=point(domain, length(domain)*QTCF_START_PARAMETER))
+
+# Check one scalar startup followed by exact symmetry pairs.
+function check_qtcf_blocks(result, domain, reflection)
+    fixed = qtcf_startup(domain).initial_node
+    @assert reflection(fixed) == fixed
+    for (k, record) in enumerate(result.history)
+        r = record.interpolant
+        pairs = r.pairs
+        @assert length(pairs) == k && length(nodes(r)) == 2k - 1
+        @assert first(pairs) == (fixed, fixed)
+        for (z, w) in @view pairs[2:end]
+            @assert z != w && reflection(z) == w
+        end
+        @assert all(b -> all(isfinite, b), RFA.weights(r))
+    end
+end
 
 # Fixed discrete grids share all continuum supports and reflected samples.
-function support_parameters(domain, result)
+continuum_nodes(result) =
+    unique([z for record in result.history for z in nodes(record.interpolant)])
+
+# Signed zeros denote the same sample coordinate.
+sample_coordinate(x::Real) = iszero(x) ? zero(x) : x
+sample_coordinate(z::Complex) = complex(sample_coordinate(real(z)), sample_coordinate(imag(z)))
+
+function support_parameters(domain, result, support)
     mesh_s, mesh_z = collect(result.path, :nodes)
-    map(nodes(get_function(result))) do z
-        distance, k = findmin(abs.(mesh_z .- z))
-        s = T(mesh_s[k])
-        # Near a nonsmooth parametrization, parameter roundoff can exceed _same.
-        h = 4eps(T) * max(one(T), abs(s))
-        bound = maximum(abs(point(domain, RFA._clean_param(domain, s + δ)) - mesh_z[k])
-            for δ in (-h, h))
-        if !RFA._same(mesh_z[k], z) && distance > bound
-            s = RFA._reflection_param(domain, zero(T), _ -> z)
+    positions = Dict{eltype(mesh_z),eltype(mesh_s)}()
+    for (s, z) in zip(mesh_s, mesh_z)
+        get!(positions, sample_coordinate(z), s)
+    end
+    map(support) do z
+        # Center neighbors at the recorded parameter, or the closest mesh point.
+        s = get(positions, sample_coordinate(z)) do
+            domain isa Segment && return T(ComplexRegions.arg(domain, z))
+            mesh_s[argmin(k -> abs(mesh_z[k] - z), eachindex(mesh_z))]
         end
-        s / length(domain)
+        T(s) / length(domain)
     end
 end
 
@@ -104,105 +150,81 @@ function discrete_grid_samples(domain, seeds)
     clean(s) = closed ? mod(s, one(T)) : clamp(s, zero(T), one(T))
     mapped(s) = point(domain, length(domain) * clean(s))
     Z = typeof(mapped(zero(T)))
-    support = Z[z for result in seeds for z in nodes(get_function(result))]
-    parameters = unique(vcat(support_parameters.(Ref(domain), seeds)...))
-    # Match the stable-evaluation grid: uniform points, nodes, and log neighbors.
+    supports = map(continuum_nodes, seeds)
+    support = unique(Z[z for points in supports for z in points])
+    parameters = unique(vcat(support_parameters.(Ref(domain), seeds, supports)...))
+    # Uniform samples, continuum nodes, and logarithmic parameter neighbors.
     uniform = mapped.(range(zero(T); step=one(T)/DISCRETE_UNIFORM_N,
-        length=DISCRETE_UNIFORM_N))
+        length=DISCRETE_UNIFORM_N + !closed))
     neighbors = Z[mapped(s + sign * 10.0^exponent)
         for s in parameters for exponent in DISCRETE_LOG_EXPONENTS for sign in (-1, 1)]
-    (; support, parameters, uniform, neighbors)
+    (; support, parameters, uniform, neighbors, seed_node_counts=length.(supports))
 end
 
 function shared_discrete_grid(domain, reflection, seeds;
     samples=discrete_grid_samples(domain, seeds),
-    source="uniform+continuum_support_union+parameter_log_neighbors+exact_reflection_closure")
-    (; support, parameters, uniform, neighbors) = samples
-    # Signed zeros denote the same coordinate, not two distinct samples.
-    cleanzero(x) = iszero(x) ? zero(x) : x
-    coordinate(z) = z isa Real ? cleanzero(z) :
-        complex(cleanzero(real(z)), cleanzero(imag(z)))
-    points = unique(coordinate.(vcat(support, uniform, neighbors)))
+    source="uniform+all_recorded_continuum_support_union+parameter_log_neighbors+exact_reflection_closure")
+    (; support, parameters, uniform, neighbors, seed_node_counts) = samples
+    points = unique(sample_coordinate.(vcat(support, uniform, neighbors)))
     Z = eltype(points)
     base_count = length(points)
-    unique!(append!(points, coordinate.(Z.(reflection.(points)))))
+    unique!(append!(points, sample_coordinate.(Z.(reflection.(points)))))
     exact = Set(points)
-    reflection_closed = all(z -> coordinate(Z(reflection(z))) in exact, points)
+    reflection_closed = all(z -> sample_coordinate(Z(reflection(z))) in exact, points)
     reflection_closed || error("The shared fitting grid is not closed under reflection")
     println("  shared fixed grid: ", base_count, " base points, ", length(points),
-        " after exact reflection closure (", length(unique(coordinate.(support))), " continuum support points)")
+        " after exact reflection closure (", length(unique(sample_coordinate.(support))), " continuum interpolation nodes)")
     flush(stdout)
     (; points, exact, parameters, closed=RFA.isclosed(domain), source, base_count,
-        reflection_closed, uniform_count=length(unique(coordinate.(uniform))),
-        support_count=length(unique(coordinate.(support))), support_parameter_count=length(parameters),
-        neighbor_count=length(unique(coordinate.(neighbors))),
-        seed_node_counts=length.(nodes.(get_function.(seeds))))
+        reflection_closed, uniform_count=length(unique(sample_coordinate.(uniform))),
+        support_count=length(unique(sample_coordinate.(support))), support_parameter_count=length(parameters),
+        neighbor_count=length(unique(sample_coordinate.(neighbors))), seed_node_counts)
+end
+
+# Preserve the original TCF fitting samples and their union order.
+function paper_interval_grid(case)
+    logarithmic = T(2) .^ ABS_FITTING_LOG_EXPONENTS
+    half = (ABS_UNIFORM_N - 1) ÷ 2
+    uniform = collect(-half:half) / T(half)
+    realpoints = union(collect(logarithmic), collect(-logarithmic),
+        collect(uniform), collect(logarithmic .- one(T)))
+    points = case.slug == "real" ? realpoints : im .* realpoints
+    reflection = symmetric(case.domain).reflection
+    exact = Set(sample_coordinate.(points))
+    (; points, exact, closed=false,
+        source="original_tcf_ordered_union+uniform_10001+log2_exponents_minus52_to_minus1+left_endpoint_cluster",
+        base_count=length(points),
+        reflection_closed=all(z -> sample_coordinate(reflection(z)) in exact, points),
+        uniform_count=length(uniform), uniform_subdivisions=ABS_UNIFORM_N-1,
+        support_count=0, support_parameter_count=0, neighbor_count=0,
+        seed_node_counts=(0, 0))
 end
 
 function run_intervals(metadata)
-    interval_seeds = map(interval_cases) do case
-        println("\nInterval continuum seed: ", case.name)
-        tcf = approximate(case.f, case.domain, TCF(); experiment_parameters(:interval, :TCF)...)
-        qtcf = approximate(symmetric(case.f), symmetric(case.domain);
-            experiment_parameters(:interval, :QTCF)...,
-            initial_node=point(case.domain, length(case.domain) * QTCF_START_PARAMETERS[case.slug]),
-            pairs_only=true)
+    map(interval_cases) do case
         reflection = symmetric(case.domain).reflection
-        for (k, record) in enumerate(qtcf.history)
-            r = record.interpolant
-            @assert length(nodes(r)) == 2k - 1
-            @assert RFA._same(first(r.pairs)...)
-            @assert all(pair -> !RFA._same(pair...), r.pairs[2:end])
-            @assert all(pair -> RFA._same(reflection(first(pair)), last(pair)), r.pairs)
-            @assert all(b -> all(isfinite, b), RFA.weights(r))
-        end
-        (tcf, qtcf)
-    end
-
-    interval_grids = if EXPERIMENT_MODE === :discrete
-        samples = map((case, seeds) -> discrete_grid_samples(case.domain, seeds),
-            interval_cases, interval_seeds)
-        # Use one coordinate grid for both intervals, so rotation changes no samples.
-        common = (; (name => unique(vcat(real.(getproperty(samples[1], name)),
-            imag.(getproperty(samples[2], name)))) for name in (:support, :uniform, :neighbors))...)
-        parameters = unique(vcat(getproperty.(samples, :parameters)...))
-        map(eachindex(interval_cases)) do j
-            case, seeds = interval_cases[j], interval_seeds[j]
-            rotate = j == 1 ? identity : x -> im * x
-            mapped = (; (name => rotate.(getproperty(common, name))
-                for name in (:support, :uniform, :neighbors))..., parameters)
-            shared_discrete_grid(case.domain, symmetric(case.domain).reflection, seeds;
-                samples=mapped,
-                source="uniform+all_interval_continuum_support_union+parameter_log_neighbors+exact_reflection_closure")
-        end
-    end
-
-    map(eachindex(interval_cases)) do j
-        case = interval_cases[j]
-        tcf, qtcf = interval_seeds[j]
         if EXPERIMENT_MODE === :discrete
-            grid = interval_grids[j]
-            reflection = symmetric(case.domain).reflection
             println("\nDiscrete interval case: ", case.name)
-            tcf = approximate(case.f, grid.points, TCF();
+            grid = paper_interval_grid(case)
+            tcf = fit_experiment(case.f, grid.points, :TCF;
                 experiment_parameters(:interval, :TCF; discrete=true)...)
-            qtcf = approximate(symmetric(case.f), symmetric(grid.points; reflection);
+            qtcf = fit_experiment(symmetric(case.f), symmetric(grid.points; reflection), :QTCF;
                 experiment_parameters(:interval, :QTCF; discrete=true)...,
-                initial_node=point(case.domain, length(case.domain) * QTCF_START_PARAMETERS[case.slug]),
-                pairs_only=true)
-            for (k, record) in enumerate(qtcf.history)
-                r = record.interpolant
-                @assert length(nodes(r)) == 2k - 1
-                @assert RFA._same(first(r.pairs)...)
-                @assert all(pair -> !RFA._same(pair...), r.pairs[2:end])
-                @assert all(pair -> RFA._same(reflection(first(pair)), last(pair)), r.pairs)
-                @assert all(b -> all(isfinite, b), RFA.weights(r))
+                qtcf_startup(case.domain)...)
+            for (method, result) in zip((:TCF, :QTCF), (tcf, qtcf))
+                record_discrete_run!(metadata, case.slug, method, result, grid, 0,
+                    length(validation_grid(case).points))
             end
-            for (k, (method, result)) in enumerate(zip((:TCF, :QTCF), (tcf, qtcf)))
-                record_discrete_run!(metadata, case.slug, method, result, grid,
-                    grid.seed_node_counts[k], length(case.points))
-            end
+        else
+            println("\nContinuum interval case: ", case.name)
+            tcf = fit_experiment(case.f, case.domain, :TCF;
+                experiment_parameters(:interval, :TCF)...)
+            qtcf = fit_experiment(symmetric(case.f), symmetric(case.domain), :QTCF;
+                experiment_parameters(:interval, :QTCF)...,
+                parameter_reflection=qtcf_parameter_reflection,
+                qtcf_startup(case.domain)...)
         end
+        check_qtcf_blocks(qtcf, case.domain, reflection)
         (; case..., runs=(tcf, qtcf))
     end
 end
@@ -216,29 +238,25 @@ end
 
 function fit_schwarz(case, method; points=nothing)
     domain = points === nothing ? case.fit_domain : points
-    startup = method === :QTCF ?
-        (; initial_node=point(case.fit_domain,
-            length(case.fit_domain) * QTCF_START_PARAMETERS[case.slug]), pairs_only=true) : (;)
-    f, domain, algorithm = method === :QTCF ?
+    startup = if method === :QTCF
+        options = qtcf_startup(case.fit_domain)
+        points === nothing ? (; options...,
+            parameter_reflection=qtcf_parameter_reflection) : options
+    else
+        (;)
+    end
+    f, domain = method === :QTCF ?
         (symmetric(conj; reflection=case.function_reflection),
-            symmetric(domain; reflection=case.reflection), QTCF()) :
-        (conj, domain, method === :AAA ? AAA() : TCF())
-    result = approximate(f, domain, algorithm;
+            symmetric(domain; reflection=case.reflection)) : (conj, domain)
+    result = fit_experiment(f, domain, method;
         experiment_parameters(:schwarz, method; discrete=points !== nothing)..., startup...)
     if method === :QTCF
-        for (k, record) in enumerate(result.history)
-            r = record.interpolant
-            @assert length(nodes(r)) == 2k - 1
-            @assert RFA._same(first(r.pairs)...)
-            @assert all(pair -> !RFA._same(pair...), r.pairs[2:end])
-            @assert all(pair -> RFA._same(case.reflection(first(pair)), last(pair)), r.pairs)
-            @assert all(b -> all(isfinite, b), RFA.weights(r))
-        end
+        check_qtcf_blocks(result, case.fit_domain, case.reflection)
     end
     result
 end
 
-function run_method(case, method, metadata; grid=nothing, seed_nodes=0)
+function run_method(case, method, audit, target, metadata; grid=nothing, seed_nodes=0)
     start = time_ns()
     result = fit_schwarz(case, method; points=grid === nothing ? nothing : grid.points)
     elapsed = (time_ns() - start) / 1e9
@@ -254,16 +272,17 @@ function run_method(case, method, metadata; grid=nothing, seed_nodes=0)
     rotation = case.rotation
     pole .*= rotation
     residue .*= abs2(rotation)
-    audit = curve_points(case.domain, SCHWARZ_AUDIT_N; periodic=RFA.isclosed(case.domain))
-    error = max_error(z -> conj(rotation) * result(z / rotation), conj.(audit), audit)
+    error = abs(rotation) * max_error(rational, target, audit.points)
     rational_degrees = degrees(rational)
     stop = status(result)
     grid === nothing || record_discrete_run!(metadata, case.slug, method, result, grid,
-        seed_nodes, length(audit))
+        seed_nodes, length(audit.points))
     (; pole, residue, error, elapsed, extraction_seconds, extraction_status,
         finite_poles, nonfinite_poles, nonfinite_residues, rational_degrees, failed=false,
         selected_nodes=length(nodes(rational)), recorded=length(result.history),
-        returned_record=stop.best, sampled_error=stop.error, stop_reason=stop.reason)
+        returned_record=stop.best, sampled_error=stop.error, stop_reason=stop.reason,
+        validation_points=length(audit.points), validation_nodes=0,
+        validation_grid_sha256=audit.metadata.grid_sha256)
 end
 
 function run_case(case, metadata)
@@ -275,24 +294,28 @@ function run_case(case, metadata)
         end
         shared_discrete_grid(case.fit_domain, case.reflection, seeds)
     end
+    audit = validation_grid(case)
+    target = conj.(audit.points)
     rows = Dict{Symbol,Any}()
     for (j, method) in enumerate(METHODS)
         print("  ", EXPERIMENT_MODE, " ", method, " ... ")
         flush(stdout)
         try
-            row = run_method(case, method, metadata; grid,
+            row = run_method(case, method, audit, target, metadata; grid,
                 seed_nodes=grid === nothing ? 0 : grid.seed_node_counts[j])
             rows[method] = row
             @printf("error %.3e, degree %s, %.3f s\n",
                 row.error, string(row.rational_degrees), row.elapsed)
         catch exception
+            exception isa InterruptException && rethrow()
             rows[method] = (
                 pole=ComplexF64[], residue=ComplexF64[],
                 error=NaN, elapsed=NaN, extraction_seconds=NaN, extraction_status=:failed,
                 finite_poles=0, nonfinite_poles=0, nonfinite_residues=0,
                 rational_degrees=(-1, -1), failed=true,
                 selected_nodes=0, recorded=0, returned_record=0,
-                sampled_error=NaN, stop_reason=:failed)
+                sampled_error=NaN, stop_reason=:failed,
+                validation_points=0, validation_nodes=0, validation_grid_sha256="")
             println("failed: ", exception)
         end
         flush(stdout)
@@ -301,13 +324,14 @@ function run_case(case, metadata)
 end
 
 function run_experiments()
+    capture_run_provenance!()
     global_logger(ConsoleLogger(stderr, Logging.Error))
     BLAS.set_num_threads(1)
     println("RationalFunctionApproximation ", pkgversion(RFA))
     println("Package source: ", pathof(RFA))
     println("Running all paper experiments.")
     EXPERIMENT_MODE === :discrete && println(
-        "Discrete mode: one fixed shared grid per case, seeded by the continuum fits.")
+        "Discrete mode: original TCF interval samples and continuum-supported Schwarz grids.")
     println("Output: ", OUTPUT)
 
     metadata = NamedTuple[]

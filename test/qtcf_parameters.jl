@@ -1,37 +1,40 @@
 # Fitting parameters.
 const T = Float64
 const METHODS = (:AAA, :TCF, :QTCF)
+const EXPERIMENT_EVAL_METHOD = OneDiv()
+const EXPERIMENT_WEIGHT_METHODS = (TCF=OneDiv(), QTCF=Classic())
 const EXPERIMENT_PARAMETERS = (
-    interval=(float_type=T, tol=100eps(T), allowed=true, max_degree=200,
-        initial_refinement=28, refinement=4, stagnation=200),
-    schwarz=(float_type=T, tol=1e-12, allowed=true, max_degree=200,
+    interval=(float_type=T, tol=T(1e-11), allowed=true, max_degree=200,
         initial_refinement=15, refinement=4, stagnation=50),
+    schwarz=(float_type=T, tol=T(4e-11), allowed=true, max_degree=200,
+        initial_refinement=28, refinement=9, stagnation=50),
 )
 const AAA_LOEWNER_TOL = 100eps(T)
-# Fixed startup locations in normalized fitting-curve coordinates.
-const QTCF_START_PARAMETERS = Dict(
-    "real" => 0.5, "imaginary" => 0.5,
-    "ellipse_1_025" => 0.5, "ellipse_1_05" => 0.5,
-    "upper_ellipse_1_05" => 0.5, "five_lobed" => 0.25,
-    "smooth_s" => 0.5, "two_semicircle_s" => 0.5,
-    "superellipse_6" => 0.5, "analytic_inlet" => 0.5,
-)
+# Fixed-point startup on the normalized fitting curve.
+const QTCF_START_PARAMETER = 0.5
+
+# All paper curves are paired by reflection of the normalized parameter.
+qtcf_parameter_reflection(s) = 1.0 - s
 
 function experiment_parameters(family, method; discrete=false)
     p = EXPERIMENT_PARAMETERS[family]
-    options = (; (key => value for (key, value) in pairs(p)
-        if key !== :initial_refinement && (!discrete || key ∉ (:max_degree, :refinement)))...,
-        max_iter=(method === :TCF ? 2 : 1) * p.max_degree)
-    discrete && return method === :AAA ? (; options..., loewner_tol=AAA_LOEWNER_TOL) : options
+    max_iter = (method === :TCF ? 2 : 1) * p.max_degree
+    options = (; p.float_type, p.tol, p.allowed, p.stagnation, max_iter)
+    if discrete
+        method === :AAA && return (; options..., loewner_tol=AAA_LOEWNER_TOL)
+        return method === :QTCF ? (; options..., p.max_degree) : options
+    end
+    options = (; options..., p.max_degree, p.refinement)
     return method === :QTCF ? (; options..., initial_refinement=p.initial_refinement) : options
 end
 
 # Sampling and validation.
 const DISCRETE_UNIFORM_N = 5000
-const DISCRETE_LOG_MIN, DISCRETE_LOG_STEP, DISCRETE_LOG_MAX = -16, 0.1, -3
-const DISCRETE_LOG_EXPONENTS = DISCRETE_LOG_MIN:DISCRETE_LOG_STEP:DISCRETE_LOG_MAX
+const DISCRETE_LOG_EXPONENTS = -7:-3
 const ABS_UNIFORM_N = 10001
-const ABS_LOG_EXPONENTS = -100:0.1:-1
+const ABS_LOG_EXPONENTS = -0.1 .* collect(10:1000)
+const ABS_FITTING_LOG_EXPONENTS = -52:1//10:-1
+const INTERVAL_DISPLAY_DEGREE = 100
 const SCHWARZ_AUDIT_N = 1800
 const SCHWARZ_CURVE_N = 700
 const INLET_OFFSET = 0.1
@@ -50,6 +53,7 @@ const CASE_LABELS = Dict(
 )
 const CONTINUUM_LIMITS = (-2.25, 2.25, -2.25, 2.25)
 const CONTINUUM_TICKS = -2:1:2
+const POLE_RESIDUE_LOG_RANGE = (-4.0, 0.0)
 const FIGURE_TITLES = (
     ("Figure_1", "Ellipse (1, 1/2)"),
     ("Figure_6_1_interval_convergence", "Interval convergence"),

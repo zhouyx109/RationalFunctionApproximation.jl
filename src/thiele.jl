@@ -132,7 +132,7 @@ end
 
 # faster for array-valued evaluation
 function evaluate(r::Thiele, z::AbstractArray{<:Number})
-    t = similar(z, eltype(r.values))
+    t = similar(z, promote_type(eltype(r), eltype(z)))
     return evaluate!(t, r, z)
 end
 
@@ -281,15 +281,18 @@ function derivative(r::Thiele{T,S}, orders::AbstractVector{<:Integer}) where {T,
 end
 
 
+# Return commonly normalized numerator/denominator jets for residue evaluation.
 function _evaluate_numden_derivs(r::Thiele, z::Number)
     n = length(r.weights)
     return if n == 1
-        r.weights[1], 1, 0, 1
+        r.weights[1], 1, 0, 0
     else
         a = r.weights[n]
         b = z - r.nodes[n-1]
         aʹ = 0
         bʹ = 1
+        scale = max(one(abs(z)), abs(a), abs(b), abs(aʹ), abs(bʹ))
+        a, b, aʹ, bʹ = a/scale, b/scale, aʹ/scale, bʹ/scale
         @inbounds for k in n-1:-1:2
             d = z - r.nodes[k-1]
             t = r.weights[k] * aʹ + bʹ
@@ -298,6 +301,9 @@ function _evaluate_numden_derivs(r::Thiele, z::Number)
             t = r.weights[k] * a + b
             b = a * d
             a = t
+            # A common scale leaves the simple-pole residue unchanged.
+            scale = max(one(abs(z)), abs(a), abs(b), abs(aʹ), abs(bʹ))
+            a, b, aʹ, bʹ = a/scale, b/scale, aʹ/scale, bʹ/scale
         end
         r.weights[1] * a + b, a, r.weights[1] * aʹ + bʹ, aʹ
     end
@@ -361,14 +367,15 @@ function Thiele(nodes::AbstractVector, values::AbstractVector, weights::Abstract
     if isempty(nodes) && eltype(nodes) == Any
         nodes = values = weights = Float64[]
     end
-    nodes, values, weights = promote(nodes, values, weights)
+    nodes, values, weights = promote(float(nodes), float(values), float(weights))
     T = eltype(values)
     return Thiele{real_type(T)}(nodes, values, weights)
 end
 
 function Thiele(x::AbstractVector, y::AbstractVector)
+    length(x) == length(y) || throw(DimensionMismatch("node and value counts must agree"))
     idx = axes(x, 1)
-    d = copy(y)
+    d = collect(float(promote_type(eltype(x), eltype(y))), y)
     for (len, i) in enumerate(idx)
         for k in first(idx, len-1)
             d[i] = (x[i] - x[k]) / (d[i] - d[k])
@@ -601,8 +608,8 @@ function approximate(
     stagnation::Int = 5,
     ) where {T<:Number,S<:Number}
 
-    m = length(z)
-    idx_test = trues(m)
+    length(y) == length(z) || throw(DimensionMismatch("node and value counts must agree"))
+    isempty(z) && throw(ArgumentError("At least one sample is required"))
     fmax = maximum(abs, y)     # scale of f
     _, idx_min = findmin(abs, y)
     r = Thiele([z[idx_min]], [y[idx_min]])
@@ -610,12 +617,22 @@ function approximate(
     z_test = copy(collect(z))
     deleteat!(y_test, idx_min)
     deleteat!(z_test, idx_min)
-    r_test = similar(y_test, promote_type(S, T))
+    r_test = similar(y_test, eltype(r))
 
     history = [IterationRecord(r, NaN, missing)]
     n = 1    # iteration counter
     stop = nothing
-    while length(z) > 0
+    while true
+        if isempty(z_test)
+            history[n].error = maximum(abs(r(z[i]) - y[i]) for i in eachindex(y, z))
+            reason, best = quitting_check(history, stagnation, tol, fmax, max_iter, allowed)
+            if reason !== :converged
+                reason, best = :exhausted, best_acceptable(history, allowed)
+                r = history[best].interpolant
+            end
+            stop = ConvergenceStatus(reason, best, history)
+            break
+        end
         evaluate!(r_test, r, z_test)
         @inbounds for i in eachindex(r_test)   # array evaluation skips the underflow check
             isnan(r_test[i]) && (r_test[i] = r(z_test[i]))
@@ -627,13 +644,7 @@ function approximate(
         reason, best = quitting_check(history, stagnation, tol, fmax, max_iter, allowed)
         if reason !== :iterating
             if reason !== :converged
-                # An infinite error estimate means there is nothing left to test against.
-                if isinf(err_max)
-                    reason, best = :exhausted, lastindex(history)
-                    @info("Used all sample values without convergence")
-                else
-                    @info("Stopping with estimated error $(round(history[best].error, sigdigits=4)) after $n iterations")
-                end
+                @info("Stopping with estimated error $(round(history[best].error, sigdigits=4)) after $n iterations")
                 r = history[best].interpolant
             end
             stop = ConvergenceStatus(reason, best, history)
@@ -658,7 +669,7 @@ function approximate(
         end
         n += 1
     end
-    return DiscreteApproximation(y, z, r, idx_test, allowed, history, stop)
+    return DiscreteApproximation(y, z, r, _remaining_mask(r, z), allowed, history, stop)
 end
 
 # Operations with scalars that can be done quickly.

@@ -47,23 +47,22 @@ function RFA.convergenceplot!(target, r::RFA.AbstractApproximation; show_best=tr
 end
 
 function RFA.convergenceplot(pos::GridPosition, r::RFA.AbstractApproximation; kwargs...)
-    ax = Axis(pos, xlabel="degree", ylabel="relative max error", yscale=log10)
+    ax = Axis(pos, xlabel="degree", ylabel="max error", yscale=log10)
     return Makie.AxisPlot(ax, RFA.convergenceplot!(ax, r; kwargs...)[1])
 end
 
-function RFA.convergenceplot(r::RFA.AbstractApproximation; kwargs...)
+function plot_convergence(r::RFA.AbstractApproximation; kwargs...)
     fig = Figure( )
     return Makie.FigureAxisPlot(fig, RFA.convergenceplot(fig[1, 1], r; kwargs...)...)
 end
 
 function RFA.errorplot!(target, r::RFA.ContinuumApproximation; use_abs=false, kwargs...)
-    # try to get enough points for a smooth result
-    N = ceil(Int, 1000 / length(nodes(r)))
-    t, τ, err = check(r, refinement=N, quiet=true, prenodes=true)
+    N = cld(1000, max(1, length(nodes(r))))
+    t, _, err = check(r; refinement=N, quiet=true, prenodes=true)
     out = if use_abs
         lines!(target, t, abs.(err); kwargs...)
     elseif isreal(err)
-        lines!(target, t, err; kwargs...)
+        lines!(target, t, real.(err); kwargs...)
     else
         series!(target, t, hcat(reim(err)...)'; kwargs...)
     end
@@ -100,7 +99,7 @@ function RFA.poleplot!(target, r::RFA.AbstractApproximation; kwargs...)
     attr = Makie.Attributes(; marker=:+, markersize=7, kwargs...)
     if r.allowed != true
         attr = merge(attr, Makie.Attributes(
-            color= [r.allowed(z) ? :black : :red for z in zp],
+            color= [RFA._pole_allowed(r.allowed, z) ? :black : :red for z in zp],
             ))
     end
     return scatter!(target, Point2.(real(zp), imag(zp)); attr...)
@@ -109,23 +108,26 @@ end
 function RFA.poleplot(pos::GridPosition, r::RFA.AbstractApproximation; kwargs...)
     ax = Axis(pos, xlabel="Re(z)", ylabel="Im(z)", aspect=DataAspect())
     out = RFA.poleplot!(ax, r; kwargs...)
-    xbox, ybox = axisbox(test_points(r))
+    xbox, ybox = axisbox(test_points(r; include_selected=true))
     limits!(ax, xbox..., ybox...)
     return Makie.AxisPlot(ax, out)
 end
 
-function RFA.poleplot(r::RFA.AbstractApproximation; kwargs...)
+function plot_poles(r::RFA.AbstractApproximation; kwargs...)
     fig = Figure( )
     return Makie.FigureAxisPlot(fig, RFA.poleplot(fig[1, 1], r; kwargs...)...)
 end
 
 function RFA.animate(r::RFA.AbstractApproximation, filename=tempname()*".mp4")
-    function get_error(n, x)
-        y = r.original.(x) - rewind(r, n).(x)
-        return abs.(y)
+    if r isa RFA.DiscreteApproximation
+        t, x, y = eachindex(r.domain), r.domain, r.data
+        parameter_label = "sample index"
+    else
+        t, x, _ = check(r; quiet=true, prenodes=true, include_selected=true)
+        y = r.original.(x)
+        parameter_label = "parameterization"
     end
-
-    t, x, _ = check(r, quiet=true, prenodes=true)
+    get_error(n) = abs.(y .- r.history[n].interpolant.(x))
     xbox, ybox = axisbox(x)
 
     fig = Figure(size=(850,400) )
@@ -134,31 +136,34 @@ function RFA.animate(r::RFA.AbstractApproximation, filename=tempname()*".mp4")
     # left axis: boundary and poles
     ax1 = Axis(fig[1,1],
         xlabel="Re(z)", ylabel="Im(z)",
-        title=@lift("Degree $(degree(rewind(r, $iter)))"),
+        title=@lift("Degree $(degree(r.history[$iter].interpolant))"),
         aspect=DataAspect()
         )
-    lines!(ax1, real(x), imag(x))
+    if r isa RFA.DiscreteApproximation
+        scatter!(ax1, real(x), imag(x); markersize=2)
+    else
+        lines!(ax1, real(x), imag(x))
+    end
     limits!(ax1, xbox..., ybox...)
-    zp = @lift complex(RFA.poles(rewind(r, $iter)))
+    zp = @lift complex.(RFA.poles(r.history[$iter].interpolant))
     pole = @lift Point2.(real($zp), imag($zp))
-    color = @lift [r.allowed(z) ? :black : :red for z in $zp]
+    color = @lift [RFA._pole_allowed(r.allowed, z) ? :black : :red for z in $zp]
     scatter!(ax1, pole; color, markersize=7)
 
     # right axis: error
-    err_data = @lift(Point2.(t, get_error($iter, x)))
+    err_data = @lift(Point2.(t, get_error($iter)))
     max_err = @lift(maximum(abs(e) for e in getindex.($err_data, 2)))
     ax2 = Axis(fig[1,2],
-        xlabel="parameterization", ylabel="error",
+        xlabel=parameter_label, ylabel="error",
         title = @lift(@sprintf("max error = %.2e", $max_err))
     )
-    max_err_hi = @lift(10 ^ min(0, 2 * ceil(log10($max_err)/2)))
+    max_err_hi = @lift(isfinite($max_err) ? 10.0^(2 * ceil(log10(max($max_err, eps())) / 2)) : 1.0)
     max_err_lo = @lift(-$max_err_hi / 20)
     lines!(ax2, err_data)
 
     record(fig, filename, eachindex(r.history); framerate=2) do n
         iter[] = n
         ylims!(ax2, max_err_lo[], max_err_hi[])
-        # autolimits!(ax2)
     end
     return filename
 end

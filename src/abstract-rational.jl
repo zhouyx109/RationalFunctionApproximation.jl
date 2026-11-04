@@ -43,7 +43,8 @@ end
 
 Returns the residue of the rational function `r` at the point `z`.
 """
-function Res(f::Function, z::Number; avoid=nothing, radius=100eps(abs(z)), n=200)
+function Res(f::Function, z::Number;
+    avoid=nothing, radius=100eps(iszero(z) ? one(abs(float(z))) : abs(float(z))), n=200)
     # Attempt to use contour integration to find a residue
     if !isnothing(avoid)
         radius = minimum(abs(z - t) / 2 for t in avoid if t != z; init=radius)

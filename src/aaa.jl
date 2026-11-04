@@ -37,7 +37,7 @@ julia> z = 1im * range(-10, 10, 500);
 
 julia> y = @. exp(z);
 
-julia> r = aaa(z, y);
+julia> r = aaa(y, z);
 
 julia> degree(r)   # both numerator and denominator
 12
@@ -63,16 +63,21 @@ function aaa(y::AbstractVector{<:Number}, z::AbstractVector{<:Number};
     stats = false
     )
 
-    fmax = norm(y, Inf)    # for scaling
     m = length(z)
+    length(y) == m || throw(DimensionMismatch("node and value counts must agree"))
+    m > 0 || throw(ArgumentError("At least one sample is required"))
+    max_degree >= 0 || throw(ArgumentError("max_degree must be nonnegative"))
+    max_nodes = min(Int(max_degree) + 1, cld(m, 2))
+    fmax = norm(y, Inf)
     iteration = NamedTuple[]
     err = float_type[]
     besterr, bestidx, best = Inf, NaN, nothing
 
     # Allocate space for Cauchy matrix, Loewner matrix, and residual
-    C = similar(z, (m, m))
-    L = similar(z, (m, m))
-    R = complex(zeros(size(z)))
+    S = float(promote_type(eltype(z), eltype(y)))
+    C = similar(z, S, (m, max_nodes))
+    L = similar(z, S, (m, max_nodes))
+    R = zeros(complex(S), m)
 
     ȳ = sum(y) / m
     s, idx = findmax(abs(y - ȳ) for y in y)
@@ -97,7 +102,8 @@ function aaa(y::AbstractVector{<:Number}, z::AbstractVector{<:Number};
             L[i, n] = (y[i] - fσ[n]) * C[i, n]
         end
         istest = collect(test_index)
-        _, _, V = svd( view(L, istest, 1:n) )
+        # A wide Loewner matrix needs the right nullspace in V.
+        _, _, V = svd(view(L, istest, 1:n); full=length(istest) < n)
         w = V[:, end]    # barycentric weights
 
         CC = view(C, istest, 1:n)
@@ -113,13 +119,10 @@ function aaa(y::AbstractVector{<:Number}, z::AbstractVector{<:Number};
 
         # Are we done?
         if (besterr <= tol*fmax) ||
-            (n == max_degree + 1) ||
+            (n == max_nodes) ||
             ((length(iteration) - bestidx >= stagnation) && (besterr < 1e-2*fmax))
             break
         end
-
-        # To make sure columns of V won't be thrown away in svd and prevent overfitting
-        if n>=((m+1)>>1) break end
 
         _, j = findmax(abs, R)
         push!(node_index, j)

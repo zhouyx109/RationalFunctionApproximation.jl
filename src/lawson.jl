@@ -2,27 +2,29 @@
 # iteratively reweighting the nodes to minimize the maximum error
 function lawson(test, ftest, node, fnode, weight, nsteps)
     n, m = length(test), length(node)
+    α, β = weight .* fnode, weight
+    F = [ftest; fnode]
+    fmax = norm(F, Inf)
+    (iszero(fmax) || nsteps == 0) && return α, β
+
     wt = ones(m + n)
     C = [ 1/(x-s) for x in test, s in node ]
-    R = (C * (weight .* fnode)) ./ (C * weight)
-    F = [ftest; fnode];  fmax = norm(F,Inf)
-    R = [R; fnode]
     A = [C; I];                                 # numerator
     B = [(ftest / fmax) .* C; diagm(fnode / fmax)]    # f*denominator
     AB = [A B]
-    ⍺, β = [], []    # put into scope
     for _ in 1:nsteps
         _, _, V =  svd( sqrt.(wt) .* AB )
-        ⍺ = V[1:m, 2m] * fmax             # numerator weights
-        β = -V[m+1:2m, 2m]                # denominator weights
-        denom = A*β
-        if any(iszero, denom)
-            break    # TODO: why does this happen?
-        end
-        R = (A*⍺) ./ denom
-        wt = normalize(wt .* abs.(F - R), Inf)  # iterative reweighting
+        next_α = V[1:m, 2m] * fmax
+        next_β = -V[m+1:2m, 2m]
+        denom = A * next_β
+        any(iszero, denom) && break
+        α, β = next_α, next_β
+        R = (A * α) ./ denom
+        error_weights = wt .* abs.(F - R)
+        all(iszero, error_weights) && break
+        wt = normalize(error_weights, Inf)
     end
-    return ⍺, β
+    return α, β
 end
 
 """
@@ -67,9 +69,10 @@ function minimax(r::ContinuumApproximation{S,T,R}, nsteps::Integer=20) where {S,
 end
 
 function minimax(r::DiscreteApproximation{S,T,R}, nsteps::Integer=20) where {S,T,R<:Barycentric}
+    test, ftest = r.domain[r.test_index], r.data[r.test_index]
     ⍺, β = lawson(test, ftest, nodes(r.fun), values(r.fun), weights(r.fun), nsteps)
     r̂ = Barycentric(nodes(r.fun), ⍺ ./ β, β, ⍺)
-    return ContinuumApproximation(r.original, r.domain, r̂, r.allowed, r.path)
+    return DiscreteApproximation(r.data, r.domain, r̂, r.test_index, r.allowed)
 end
 # just for some experimentation
 function brasil(r::ContinuumApproximation{T}; tol=1000*eps(T), σmax=0.1, τ=0.1, max_iter=20) where T

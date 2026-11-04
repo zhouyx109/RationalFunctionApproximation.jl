@@ -159,7 +159,7 @@ end
 
 # faster version for evaluation on an array
 function evaluate(r::Barycentric, z::AbstractArray{<:Number})
-    u = similar(z, eltype(r.values))
+    u = similar(z, promote_type(eltype(r), eltype(z)))
     return evaluate!(u, r, z)
 end
 
@@ -486,9 +486,12 @@ function approximate(
     ) where {T<:Number,S<:Number}
 
     @assert isfinite(loewner_tol) && loewner_tol >= 0
+    length(y) == length(z) || throw(DimensionMismatch("node and value counts must agree"))
+    isempty(z) && throw(ArgumentError("At least one sample is required"))
     m = length(z)
     fmax = maximum(abs, y)     # scale of f
-    values = complex(similar(y))
+    number_type = float(promote_type(eltype(z), eltype(y)))
+    values = similar(y, complex(number_type))
 
     _, i₀ = findmin(abs, y)
     idx_test = trues(m)
@@ -497,7 +500,6 @@ function approximate(
     idx_fit = copy(idx_test)
     iszero(loewner_tol) || (idx_fit .&= abs.(z .- z[i₀]) .> separation)
 
-    number_type = promote_type(eltype(z), eltype(y))
     C = Array{number_type}(undef, m, max_iter+1)
     L = Array{number_type}(undef, m, max_iter+1)
     @inbounds for i in 1:m
@@ -543,8 +545,16 @@ function approximate(
         push!(history, IterationRecord(r, NaN, missing))
         n += 1
     end
-    stop = @something stop ConvergenceStatus(:exhausted, lastindex(history), history)
-    return DiscreteApproximation(y, z, r, idx_test, allowed, history, stop)
+    if stop === nothing
+        history[n].error = maximum(abs(r(z[i]) - y[i]) for i in eachindex(y, z))
+        reason, best = quitting_check(history, stagnation, tol, fmax, max_iter, allowed)
+        if reason !== :converged
+            reason, best = :exhausted, best_acceptable(history, allowed)
+            r = history[best].interpolant
+        end
+        stop = ConvergenceStatus(reason, best, history)
+    end
+    return DiscreteApproximation(y, z, r, _remaining_mask(r, z), allowed, history, stop)
 end
 
 # Operations with scalars that can be done quickly.
