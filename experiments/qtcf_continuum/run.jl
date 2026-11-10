@@ -40,7 +40,6 @@ function validation_grid(case)
 end
 
 include("traced_classic.jl")
-include("normalized_qtcf.jl")
 
 const DEST = @__DIR__
 const REL_TOL = 4e-11
@@ -81,28 +80,10 @@ end
 
 # All errors are measured in the original fitting coordinate.
 function lifted(r, z, kind)
-    kind in (:forced, :native, :QTCF) && return RFA.evaluate(r, z, OneDiv())
+    kind in (:forced, :QTCF) && return RFA.evaluate(r, z, OneDiv())
     isempty(r.weights) && return zero(z)
     value = RFA.evaluate(r, z*z, OneDiv())
     return kind === :even ? value : z * value
-end
-
-function lifted_values!(out, r, z, kind, work, a, b, u)
-    if kind in (:forced, :native, :QTCF)
-        RFA.evaluate!(out, r, z, a, b)
-    elseif isempty(r.weights)
-        fill!(out, zero(eltype(out)))
-    else
-        @. u = z*z
-        RFA.evaluate!(work, r, u, a, b)
-        for i in eachindex(out)
-            out[i] = kind === :even ? work[i] : z[i]*work[i]
-        end
-    end
-    for i in eachindex(out)
-        isnan(out[i]) && (out[i] = lifted(r, z[i], kind))
-    end
-    out
 end
 
 function validation_error(r, kind, case)
@@ -191,27 +172,25 @@ function attempt_row(case,method,kind,block,leg,r,z,y,w;accepted=false,reason=""
       pre_error=before,accepted,reason=string(reason),native_guard_would_accept=!isnan(w))
 end
 
-# Physical-residual drivers rebuild the historical QTCF mesh after each completed block.
-# Only scalar coefficient insertion differs. Failed second legs retain the partial model.
-# The direct paired baseline starts at an endpoint. The folded baseline
-# chooses pairs by the error measured in the original variable.
-function paired_fit(case,kind;coefficient=EXPERIMENT_WEIGHT_METHODS.TCF,log_attempts=false,method_label="",
-    evaluate_fit=lifted_values!, midpoint_start::Bool=false)
+# Choose a point by its own error, then insert it and its reflection one at a time.
+# The main baseline starts at an endpoint. The separate control starts at the midpoint.
+function paired_fit(case;log_attempts=false,method_label="forced_Classic",midpoint_start::Bool=false)
+    kind = :forced
+    coefficient = EXPERIMENT_WEIGHT_METHODS.TCF
     d,f,reflection=case.domain,(log_attempts ? CountedTarget(case.f) : case.f),case.reflection
     options=fit_parameters(case,:QTCF)
     refinement=options.refinement;initial_refinement=options.initial_refinement
-    paired=kind===:forced
-    endpoint_start = paired && !midpoint_start
+    endpoint_start = !midpoint_start
     L=Float64(length(d));start=endpoint_start ? 0.0 : L/2
     z0=point(d,start);y0=f(z0);S=promote_type(typeof(z0),typeof(y0))
-    mate=paired ? reflection(z0) : z0
+    mate=reflection(z0)
     startup_pair=mate!=z0
     max_iter=options.max_iter-Int(startup_pair)
     sampling_rule=endpoint_start ? "first endpoint and its reflection; interior greedy mesh" :
         "midpoint startup; original-variable residual and interior block mesh"
-    r=kind in (:forced,:even) ? Thiele(S[z0],S[y0],S[y0]) : Thiele(S[],S[],S[])
+    r=Thiele(S[z0],S[y0],S[y0])
     attempts=NamedTuple[]
-    if log_attempts && !isempty(nodes(r))
+    if log_attempts
         empty=Thiele(S[],S[],S[])
         push!(attempts,attempt_row(case,method_label,kind,1,1,empty,z0,y0,y0;
             accepted=true,reason="startup",parameter=start))
@@ -239,7 +218,7 @@ function paired_fit(case,kind;coefficient=EXPERIMENT_WEIGHT_METHODS.TCF,log_atte
         push!(r.nodes,mate);push!(r.values,v);push!(r.weights,weight)
         push!(selected_params,s);push!(selected_nodes,mate);push!(selected_values,raw)
     end
-    check_center=paired && case.parity!==:none
+    check_center=case.parity!==:none
     center=check_center ? point(d,L/2) : z0
     center_value=check_center ? f(center) : y0
     RFA.reset!(path,RFA._mesh_params(d,(),selected_params,Float64);refinement=path.nref)
@@ -249,7 +228,7 @@ function paired_fit(case,kind;coefficient=EXPERIMENT_WEIGHT_METHODS.TCF,log_atte
     fmax=0.0
     history=RFA.IterationRecord[RFA.IterationRecord(r,NaN,missing)]
     supports=[copy(selected_nodes)];errors=Float64[]
-    ztest,ytest=S[],S[];out,work,a,b,u=S[],S[],S[],S[],S[]
+    ztest,ytest=S[],S[];out,a,b=S[],S[],S[]
     reason,best=:max_degree,1;failure=nothing;partial=nothing;residual_evaluations=0
     while true
         empty!(active)
@@ -268,9 +247,12 @@ function paired_fit(case,kind;coefficient=EXPERIMENT_WEIGHT_METHODS.TCF,log_atte
             push!(ztest,center)
             push!(ytest,center_value)
         end
-        for buffer in (out,work,a,b,u);resize!(buffer,length(ztest));end
+        for buffer in (out,a,b);resize!(buffer,length(ztest));end
         resize!(errors,length(ztest))
-        evaluate_fit(out,r,ztest,kind,work,a,b,u)
+        RFA.evaluate!(out,r,ztest,a,b)
+        for i in eachindex(out)
+            isnan(out[i]) && (out[i] = lifted(r,ztest[i],kind))
+        end
         @. errors=abs(ytest-out)
         residual_evaluations+=length(ztest)
         history[end].error=maximum(errors)
@@ -288,37 +270,24 @@ function paired_fit(case,kind;coefficient=EXPERIMENT_WEIGHT_METHODS.TCF,log_atte
             reason,best=:nonfinite_target,RFA.best_acceptable(history,true)
             failure=(;block=length(history)+1,leg=0,node=w,weight=oftype(v,NaN));break
         end
-        if kind===:forced
-            trial=copy(r)
-            for (leg,node,value,param) in ((1,z,y,sp),(2,w,v,partner))
-                weight=RFA._new_weight(coefficient,trial.nodes,trial.weights,node,value)
-                finite=isfinite(weight)
-                log_attempts && push!(attempts,attempt_row(case,method_label,kind,length(history)+1,leg,
-                    trial,node,value,weight;accepted=finite,reason=finite ? "accepted" : "nonfinite_weight",parameter=param))
-                if !finite
-                    failure=(;block=length(history)+1,leg,node,weight)
-                    partial=copy(trial)
-                    break
-                end
-                # Use the already-computed native coefficient; no duplicate weight calculation.
-                push!(trial.nodes,node);push!(trial.values,value);push!(trial.weights,weight)
-            end
-            if failure!==nothing
-                reason,best=:nonfinite_weight,RFA.best_acceptable(history,true);break
-            end
-            r=trial
-        else
-            node=z*z;value=kind===:even ? y : y/z
-            weight=isempty(r.weights) ? value : RFA._new_weight(coefficient,r.nodes,r.weights,node,value)
-            finite=isfinite(weight)&&isfinite(value)
-            log_attempts && push!(attempts,attempt_row(case,method_label,kind,length(history)+1,1,
-                r,node,value,weight;accepted=finite,reason=finite ? "accepted" : "nonfinite_weight",parameter=sp))
+        trial=copy(r)
+        for (leg,node,value,param) in ((1,z,y,sp),(2,w,v,partner))
+            weight=RFA._new_weight(coefficient,trial.nodes,trial.weights,node,value)
+            finite=isfinite(weight)
+            log_attempts && push!(attempts,attempt_row(case,method_label,kind,length(history)+1,leg,
+                trial,node,value,weight;accepted=finite,reason=finite ? "accepted" : "nonfinite_weight",parameter=param))
             if !finite
-                failure=(;block=length(history)+1,leg=1,node,weight)
-                partial=copy(r);reason,best=:nonfinite_weight,RFA.best_acceptable(history,true);break
+                failure=(;block=length(history)+1,leg,node,weight)
+                partial=copy(trial)
+                break
             end
-            push!(r.nodes,node);push!(r.values,value);push!(r.weights,weight)
+            # Use the already-computed native coefficient; no duplicate weight calculation.
+            push!(trial.nodes,node);push!(trial.values,value);push!(trial.weights,weight)
         end
+        if failure!==nothing
+            reason,best=:nonfinite_weight,RFA.best_acceptable(history,true);break
+        end
+        r=trial
         push!(history,RFA.IterationRecord(r,NaN,missing))
         append!(selected_params,(sp,partner));append!(selected_nodes,(z,w));append!(selected_values,(y,vraw))
         push!(supports,copy(selected_nodes))
@@ -376,41 +345,27 @@ function native_call(call,case,label,kind,log_attempts)
     end
 end
 
-# Keep the same greedy driver for both QTCFs and switch only the block update.
-function production_fit(case,method;log_attempts=false,method_label=string(method),count_target=log_attempts)
-    f=count_target ? CountedTarget(case.f) : case.f
-    quadratic=method in (:QTCF, :normalized_QTCF)
-    trace=log_attempts && quadratic ? NamedTuple[] : nothing
-    options=fit_parameters(case,quadratic ? :QTCF : :TCF)
-    quadratic || (options=merge(options,(;max_iter=PHYSICAL_CAP)))
-    call=() -> begin
-        result=if quadratic
-            startup=point(case.domain,length(case.domain)/2)
-            weight_method=method === :normalized_QTCF ? NormalizedQTCF(trace) :
-                trace === nothing ? Classic() : TracedClassic(trace)
-            eval_method=OneDiv()
-            comparison_scale=case.parity===:none ? nothing : case.target_scale
-            approximate(f,case.domain,QTCF();options...,weight_method,eval_method,
-                reflection=case.reflection,value_reflection=case.value_map,
-                initial_node=startup,pairs_only=true,comparison_scale,
-                parameter_reflection=s -> length(case.domain)-s)
-        else
-            approximate(f,case.domain,TCF();options...)
-        end
-        (get_function(result),result)
-    end
-    (r,result),attempts=quadratic ? (call(),NamedTuple[]) :
-        native_call(call,case,method_label,:native,log_attempts)
+# Run the original midpoint-start QTCF with the package's Classic construction.
+function production_fit(case;log_attempts=false)
+    f = log_attempts ? CountedTarget(case.f) : case.f
+    trace = log_attempts ? NamedTuple[] : nothing
+    options = fit_parameters(case,:QTCF)
+    startup = point(case.domain,length(case.domain)/2)
+    weight_method = trace === nothing ? Classic() : TracedClassic(trace)
+    comparison_scale = case.parity === :none ? nothing : case.target_scale
+    result = approximate(f,case.domain,QTCF();options...,weight_method,eval_method=OneDiv(),
+        reflection=case.reflection,value_reflection=case.value_map,
+        initial_node=startup,pairs_only=true,comparison_scale,
+        parameter_reflection=s -> length(case.domain)-s)
     if trace !== nothing
-        append!(REDUCTIONS, [(;case=case.slug,method=method_label,row...) for row in trace])
+        append!(REDUCTIONS, [(;case=case.slug,method="QTCF",row...) for row in trace])
     end
-    (;r,history=result.history,best=status(result).best,reason=status(result).reason,
+    (;r=get_function(result),history=result.history,best=status(result).best,reason=status(result).reason,
       supports=[copy(nodes(h.interpolant)) for h in result.history],
-      kind=quadratic ? :QTCF : :native,path=result.path,production=result,
-      counts=counter_snapshot(f),attempts,failure=nothing,partial=nothing,
+      kind=:QTCF,path=result.path,production=result,
+      counts=counter_snapshot(f),attempts=NamedTuple[],failure=nothing,partial=nothing,
       residual_evaluations=-1,center_limit_supplied=false,
-      sampling_rule=quadratic ? "native QTCF midpoint and complete pairs" :
-        "native TCF refinement 15/9")
+      sampling_rule="native QTCF midpoint and complete pairs")
 end
 
 # Native transformed fits retain native TCF mesh, transformed residual and stopping.
@@ -465,10 +420,7 @@ end
 # Lift every finite scalar pencil candidate, retaining central and cancelled candidates.
 function extracted(r,kind)
     isempty(nodes(r)) && return ComplexF64[],ComplexF64[]
-    if kind === :QTCF && r.chart === nothing && any(a -> last(a) != 1, r.apolys)
-        return normalized_residues(r)
-    end
-    if kind in (:forced,:native,:QTCF)
+    if kind in (:forced,:QTCF)
         return residues(r)
     end
     root, res = residues(r)
@@ -492,7 +444,7 @@ function max_symmetry_defect(pole,reflection)
     maximum(minimum(abs(reflection(z)-w) for w in finite) for z in finite)
 end
 
-# Include the scaled block numerators when checking that tracing leaves the fit unchanged.
+# Check that timing and tracing produce the same stored block coefficients.
 function same_interpolant(a, b)
     isequal(nodes(a), nodes(b)) && isequal(weights(a), weights(b)) &&
         (!(a isa QuadraticThiele) || isequal(a.apolys, b.apolys))
@@ -612,10 +564,10 @@ function main()
     open(joinpath(DEST,"provenance.txt"),"w") do io
         println(io,"Started UTC: ",Dates.now(Dates.UTC))
         println(io,"Frozen package: ",PACKAGE,"; Julia ",VERSION,"; BLAS threads 1; Float64")
-        println(io,"QTCF, Paired TCF and TCF with symmetric pairing: ",INITIAL_REFINEMENT,"/",STEADY_REFINEMENT," once per complete post-startup block, with full mesh rebuilds.")
-        println(io,"Native TCF and native square fits: ",SCALAR_INITIAL_REFINEMENT,"/",STEADY_REFINEMENT," once per inserted scalar support.")
-        println(io,"Float64 relative tolerance ",REL_TOL," on all cases and for all methods. Group L block-based fits use the historical running maximum sampled target scale. Matched Group P methods use a common physical validation scale.")
-        println(io,"Original QTCF and all TCF use Classic construction. Normalized QTCF uses projective construction and shared per-block normalization. All fits use OneDiv evaluation.")
+        println(io,"QTCF and Paired TCF: ",INITIAL_REFINEMENT,"/",STEADY_REFINEMENT," once per complete post-startup block, with full mesh rebuilds.")
+        println(io,"Native square TCF: ",SCALAR_INITIAL_REFINEMENT,"/",STEADY_REFINEMENT," once per inserted scalar support.")
+        println(io,"Float64 relative tolerance ",REL_TOL," on all cases and for all methods. Group L block-based fits use the historical running maximum sampled target scale. Group P QTCF and Paired TCF use a common physical validation scale.")
+        println(io,"All methods use Classic construction and OneDiv evaluation.")
         println(io,"Source base e19e600b4d0bca9ed12d6e6fa6369923ee6329b6. The experiment patch supplies a common Group P stopping scale for QTCF.")
         println(io,"Paired TCF starts at the first endpoint and inserts its reflection immediately unless fixed. A failed initial pair returns no model.")
         println(io,"Native square TCF starts at the square of the first endpoint. Its terminal parameter is the original midpoint.")
@@ -637,12 +589,9 @@ function main()
         for (i,z) in enumerate(curve_points(case.domain,700))
             value=z*case.rotation;push!(DOMAIN_ROWS,(;case=case.slug,index=i,real=real(value),imag=imag(value)))
         end
-        measure("QTCF",log -> production_fit(case,:QTCF;log_attempts=log))
-        measure("normalized_QTCF",log -> production_fit(case,:normalized_QTCF;log_attempts=log))
-        measure("native_TCF",log -> production_fit(case,:TCF;log_attempts=log,method_label="native_TCF"))
-        measure("forced_Classic",log -> paired_fit(case,:forced;log_attempts=log,method_label="forced_Classic"))
-        if case.parity!==:none
-            measure("folded_direct_Classic",log -> paired_fit(case,case.parity;log_attempts=log,method_label="folded_direct_Classic"))
+        measure("QTCF",log -> production_fit(case;log_attempts=log))
+        measure("forced_Classic",log -> paired_fit(case;log_attempts=log))
+        if case.parity !== :none
             measure("native_squared",log -> native_square_fit(case;log_attempts=log))
         end
     end

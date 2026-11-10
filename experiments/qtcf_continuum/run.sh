@@ -77,13 +77,12 @@ run_logged startup run_julia check_startup.jl
 run_logged matched_midpoint run_julia check_matched_midpoint.jl
 run_logged pole_quality run_julia check_pole_quality.jl
 run_logged curve_spectra run_julia check_curve_spectra.jl
-run_logged fixed_nodes run_julia run_audit.jl
 run_logged stress_3_3 run_julia stress_3_3.jl
 run_logged claim_1 python3 claim_1.py supports.csv
 run_logged interval_replay python3 replay_interval_reductions.py
 run_logged figures run_julia render_grouped_figures.jl
 run_logged tables python3 build_tables.py
 
-cp ./*.csv ./group_*_rows.tex provenance.txt qtcf_normalized_update_figures.pdf "$output_dir/"
+cp ./*.csv ./group_*_rows.tex provenance.txt qtcf_required_comparison_figures.pdf "$output_dir/"
 cp -R interval_certification "$output_dir/"
 printf 'Results: %s\n' "$output_dir"

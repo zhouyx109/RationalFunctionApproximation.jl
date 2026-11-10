@@ -29,20 +29,16 @@ const FORMULA = Dict(
     "analytic_inlet" => L"z(t)=0.1-0.1\cos t-0.7\cos2t-0.1\cos3t-i(0.8\sin t+0.4\sin2t+0.2\sin3t)",
 )
 const BLUE = RGBf(0 / 255, 114 / 255, 178 / 255)
-const GOLD = RGBf(230 / 255, 159 / 255, 0 / 255)
 const GREEN = RGBf(0 / 255, 158 / 255, 115 / 255)
 const VERMILION = RGBf(213 / 255, 94 / 255, 0 / 255)
 const SKY = RGBf(86 / 255, 180 / 255, 233 / 255)
 const QTCF_MIDPOINT = "QTCF"
-const NORMALIZED_QTCF = "normalized_QTCF"
 const PAIRED_CLASSIC = "forced_Classic"
+const NATIVE_SQUARE = "native_squared"
 const STYLES = Dict(
-    "native_TCF" => ("Greedy TCF", GOLD, :solid, :circle),
     QTCF_MIDPOINT => ("QTCF (midpoint)", GREEN, :solid, :circle),
-    NORMALIZED_QTCF => ("Normalized QTCF", RGBf(204 / 255, 121 / 255, 167 / 255), :dash, :diamond),
     PAIRED_CLASSIC => ("Paired TCF", VERMILION, :solid, :utriangle),
-    "folded_direct_Classic" => ("TCF with symmetric pairing", BLUE, :solid, :rect),
-    "native_squared" => ("Native square TCF", SKY, :dashdot, :diamond),
+    NATIVE_SQUARE => ("Native square TCF", SKY, :dashdot, :diamond),
 )
 
 function read_table(folder, name)
@@ -81,14 +77,13 @@ function through_best_validation(history)
     return history
 end
 
-method_label(method; group_p=false) =
-    group_p && method == "native_TCF" ? "Ordinary TCF" : STYLES[method][1]
+method_label(method) = STYLES[method][1]
 
-function convergence_legend!(position, methods; nbanks=1, crosses=false, group_p=false)
+function convergence_legend!(position, methods; nbanks=1, crosses=false)
     elements = [[LineElement(color=STYLES[method][2], linestyle=STYLES[method][3], linewidth=1.3),
         MarkerElement(color=STYLES[method][2], marker=STYLES[method][4], markersize=4)]
         for method in methods]
-    labels = [method_label(method; group_p) for method in methods]
+    labels = method_label.(methods)
     if crosses
         push!(elements, [MarkerElement(color=:black, marker=:xcross, markersize=6)])
         push!(labels, "nonfinite error")

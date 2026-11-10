@@ -12,7 +12,7 @@ function matched_midpoint()
         @assert midpoint == case.reflection(midpoint)
         scale = case_metrics(case).absolute_target / REL_TOL
 
-        paired = paired_fit(case, :forced; midpoint_start=true, log_attempts=true)
+        paired = paired_fit(case; midpoint_start=true, log_attempts=true)
         original = fits[(case.slug, "QTCF")]
         @assert first(nodes(paired.r)) == first(nodes(original.r)) == midpoint
         for (method, fit) in (("midpoint_paired_TCF", paired), ("QTCF", original))

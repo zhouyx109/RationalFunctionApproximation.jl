@@ -16,21 +16,11 @@ AXES = {"real": "Real axis", "imaginary": "Imaginary axis"}
 ODD = {"smooth_s": "Smooth S", "two_semicircle_s": "Two-semicircle S", "odd_sine": r"\(\sin x\)"}
 LABELS = {
     "QTCF": "QTCF (midpoint)",
-    "normalized_QTCF": "Normalized QTCF",
     "forced_Classic": "Paired TCF",
-    "folded_direct_Classic": "TCF with symmetric pairing",
     "native_squared": "Native square TCF",
-    "native_TCF": "Ordinary TCF",
 }
-L_METHODS = ("QTCF", "normalized_QTCF", "forced_Classic")
-AXIS_METHODS = (
-    "QTCF", "normalized_QTCF", "forced_Classic",
-    "folded_direct_Classic", "native_squared", "native_TCF",
-)
-ODD_METHODS = (
-    "QTCF", "normalized_QTCF", "forced_Classic",
-    "folded_direct_Classic", "native_squared", "native_TCF",
-)
+L_METHODS = ("QTCF", "forced_Classic")
+P_METHODS = (*L_METHODS, "native_squared")
 REL_TOL = 4e-11
 
 
@@ -93,8 +83,8 @@ def main():
         return ("\n" + r"\addlinespace[3pt]" + "\n").join(blocks)
 
     for name, table in (("group_l_rows", group_rows(L_CASES, L_METHODS)),
-                        ("group_p_interval_rows", group_rows(AXES, AXIS_METHODS, include_poles=True)),
-                        ("group_p_odd_rows", group_rows(ODD, ODD_METHODS))):
+                        ("group_p_interval_rows", group_rows(AXES, P_METHODS, include_poles=True)),
+                        ("group_p_odd_rows", group_rows(ODD, P_METHODS))):
         (HERE / f"{name}.tex").write_text(table + "\n")
 
 

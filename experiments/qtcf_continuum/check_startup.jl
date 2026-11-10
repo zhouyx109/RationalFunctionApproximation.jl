@@ -6,8 +6,8 @@ function certify_startup()
     cases = Dict(c.slug=>c for c in make_cases())
     starts = NamedTuple[]
     for ((slug, method), fit) in sort!(collect(fits);by=first)
-        quadratic = method in ("QTCF", "normalized_QTCF")
-        (quadratic || method in ("forced_Classic", "native_squared")) || continue
+        @assert method in ("QTCF", "forced_Classic", "native_squared")
+        quadratic = method == "QTCF"
         c = cases[slug]
         squared = method == "native_squared"
         L = length(c.domain)

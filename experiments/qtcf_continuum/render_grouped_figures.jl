@@ -2,20 +2,15 @@
 const CONTINUUM = @__DIR__
 include("figure_base.jl")
 
-const SQUARE_CLASSIC = "folded_direct_Classic"
 const RELATIVE_TARGET = 4e-11
 const L_GROUPS = (("ellipse_1_025", "ellipse_1_05", "upper_ellipse_1_05"),
     ("five_lobed", "superellipse_6", "analytic_inlet"))
 const EXACT_GROUPS = (L_GROUPS..., INTERVALS, (S_CASES..., "odd_sine"))
-const L_METHODS = ("native_TCF", PAIRED_CLASSIC, QTCF_MIDPOINT, NORMALIZED_QTCF)
-const P_INTERVAL_METHODS = ("native_TCF", QTCF_MIDPOINT, PAIRED_CLASSIC, SQUARE_CLASSIC,
-    "native_squared", NORMALIZED_QTCF)
-const EXACT_METHODS = (L_METHODS, L_METHODS,
-    P_INTERVAL_METHODS,
-    ("native_TCF", PAIRED_CLASSIC, QTCF_MIDPOINT,
-        SQUARE_CLASSIC, "native_squared", NORMALIZED_QTCF))
-const GROUPED_FILENAME = "qtcf_normalized_update_figures.pdf"
-const GROUP_P_FILENAME = "qtcf_normalized_update_group_p_figures.pdf"
+const L_METHODS = (QTCF_MIDPOINT, PAIRED_CLASSIC)
+const P_METHODS = (L_METHODS..., NATIVE_SQUARE)
+const EXACT_METHODS = (L_METHODS, L_METHODS, P_METHODS, P_METHODS)
+const GROUPED_FILENAME = "qtcf_required_comparison_figures.pdf"
+const GROUP_P_FILENAME = "qtcf_required_comparison_group_p_figures.pdf"
 
 function degree_histories(folder)
     degrees = Dict((row.case, row.method, row.block) => row
@@ -75,12 +70,11 @@ end
 
 function grouped_poles(data, exact_degrees, cases, destination; point_reflection=false)
     figure = Figure(size=(720, 760), fontsize=8.5, figure_padding=2)
-    methods = point_reflection ? ("native_TCF", SQUARE_CLASSIC, PAIRED_CLASSIC,
-        QTCF_MIDPOINT, NORMALIZED_QTCF) : L_METHODS
+    methods = point_reflection ? P_METHODS : L_METHODS
     columns = length(methods)
-    panel_size = point_reflection ? 140 : 160
+    panel_size = point_reflection ? 170 : 210
     for (j, method) in enumerate(methods)
-        Label(figure[0, j], method_label(method; group_p=point_reflection);
+        Label(figure[0, j], method_label(method);
             fontsize=point_reflection ? 11 : 12, font=:bold)
         colsize!(figure.layout, j, Fixed(panel_size))
     end
@@ -125,7 +119,7 @@ end
 function grouped_intervals(data, destination)
     figure = Figure(size=(720, 340), fontsize=11)
     highest_degree = maximum(parse(Int, row.q_degree)
-        for case in INTERVALS for method in methods_with_history(data.histories, (case,), P_INTERVAL_METHODS)
+        for case in INTERVALS for method in methods_with_history(data.histories, (case,), P_METHODS)
         for row in through_best_validation(data.histories[(case, method)]))
     xmax = max(100, 20 * cld(highest_degree, 20))
     flags = false
@@ -134,15 +128,15 @@ function grouped_intervals(data, destination)
             xlabel="nominal denominator degree", ylabel="relative max error", titlesize=14, xticks=0:20:xmax)
         xlims!(axis, 0, xmax)
         draw_target!(axis)
-        methods = methods_with_history(data.histories, (case,), P_INTERVAL_METHODS)
+        methods = methods_with_history(data.histories, (case,), P_METHODS)
         result = convergence_panel!(axis, data.histories, case, methods, :q_degree)
         flags |= result.nonfinite
-        pair_startup_note!(axis, data, data.histories, case, P_INTERVAL_METHODS)
+        pair_startup_note!(axis, data, data.histories, case, P_METHODS)
         text!(axis, 0.96, 0.94; text=column == 1 ? "(a)" : "(b)", space=:relative,
             align=(:right, :top), fontsize=14)
     end
-    methods = methods_with_history(data.histories, INTERVALS, P_INTERVAL_METHODS)
-    convergence_legend!(figure[2, 1:2], methods; nbanks=2, crosses=flags, group_p=true)
+    methods = methods_with_history(data.histories, INTERVALS, P_METHODS)
+    convergence_legend!(figure[2, 1:2], methods; crosses=flags)
     Label(figure[3, 1:2], "Circles mark the lowest independent-grid error. Dotted line marks relative tolerance 4 × 10⁻¹¹."; fontsize=9)
     rowgap!(figure.layout, 2)
     colgap!(figure.layout, 12)
@@ -166,8 +160,7 @@ function grouped_exact_page(data, histories, cases, methods, destination)
     end
     legend_row = 2length(cases) + 1
     available = methods_with_history(histories, cases, methods)
-    convergence_legend!(figure[legend_row, 1:2], available; nbanks=cld(length(available), 4),
-        crosses=has_nonfinite, group_p=cases ∉ L_GROUPS)
+    convergence_legend!(figure[legend_row, 1:2], available; crosses=has_nonfinite)
     note = "Circles mark the lowest independent-grid error. Dotted line marks relative tolerance 4 × 10⁻¹¹.\nCurves may overlap. Reduced degree can fall."
     has_nonfinite && (note *= "\nCrosses mark nonfinite errors on the independent grid.")
     Label(figure[legend_row + 1, 1:2], note; fontsize=9)
