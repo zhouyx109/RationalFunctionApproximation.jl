@@ -1,0 +1,65 @@
+--- a/src/Quadratic_Thiele.jl
++++ b/src/Quadratic_Thiele.jl
+@@ -1640,7 +1640,8 @@
+ """
+     approximate(f, curve, QTCF(); fixed_points, initial_node, float_type, tol, max_degree=100, kwargs...)
+ 
+-Use adaptive interior samples. Startup uses the parameter midpoint unless
++Use adaptive interior samples, with the terminal parameter excluded from the
++greedy search. Startup uses the parameter midpoint unless
+ initial_node is supplied. With fixed_points, use each supplied fixed point as
+ one scalar block, in order, before greedy selection. Later symmetric blocks
+ contain pairs by default; other fixed points are skipped.
+@@ -1661,7 +1662,8 @@
+     fixed_points=nothing, pairs_only::Bool=(reflection !== nothing),
+     weight_method::ThieleMethod=default_weight_method(),
+     eval_method::ThieleMethod=default_eval_method(), refinement::Int=3,
+-    initial_refinement::Int=15, parameter_reflection::Union{Nothing,Function}=nothing)
++    initial_refinement::Int=15, parameter_reflection::Union{Nothing,Function}=nothing,
++    comparison_scale=nothing)
+     refinement >= 1 || throw(ArgumentError("refinement must be positive"))
+     max_iter >= 1 || throw(ArgumentError("max_iter must be positive"))
+     pairs_only && reflection === nothing && throw(ArgumentError("pairs_only requires a reflection map"))
+@@ -1709,10 +1711,12 @@
+     history = IterationRecord[IterationRecord(r, NaN, missing)]
+     reason, best = :max_degree, 1
+ 
++    terminal = length(d)
+     while true
+         empty!(active)
+         for j in 2:num_ref+1, i in 1:length(path.next)
+             index = (j - 1) * rows + i
++            path.params[index] < terminal || continue
+             sample = τ[index]
+             (sample + zero(sample)) in selected_nodes || push!(active, index)
+         end
+@@ -1738,7 +1742,7 @@
+             w = fixed[next_fixed] + zero(z)
+             block = _qtcf_block(sampler, s, w, f(w), reflection, value_reflection)
+         else
+-            reason, best = quitting_check(history, stagnation, tol, fmax, max_iter, policy)
++            reason, best = quitting_check(history, stagnation, tol, something(comparison_scale, fmax), max_iter, policy)
+             reason === :iterating || break
+             if isempty(eligible)
+                 reason, best = :exhausted, best_acceptable(history, policy)
+--- a/test/qtcf_parameters.jl
++++ b/test/qtcf_parameters.jl
+@@ -2,12 +2,15 @@
+ const T = Float64
+ const METHODS = (:AAA, :TCF, :QTCF)
+ const EXPERIMENT_EVAL_METHOD = OneDiv()
+-const EXPERIMENT_WEIGHT_METHODS = (TCF=OneDiv(), QTCF=Classic())
++const EXPERIMENT_WEIGHT_METHODS = (TCF=Classic(), QTCF=Classic())
++const INITIAL_REFINEMENT = 28
++const STEADY_REFINEMENT = 9
++const SCALAR_INITIAL_REFINEMENT = 15
+ const EXPERIMENT_PARAMETERS = (
+     interval=(float_type=T, tol=T(1e-11), allowed=true, max_degree=200,
+-        initial_refinement=15, refinement=4, stagnation=50),
++        initial_refinement=INITIAL_REFINEMENT, refinement=STEADY_REFINEMENT, stagnation=50),
+     schwarz=(float_type=T, tol=T(4e-11), allowed=true, max_degree=200,
+-        initial_refinement=28, refinement=9, stagnation=50),
++        initial_refinement=INITIAL_REFINEMENT, refinement=STEADY_REFINEMENT, stagnation=50),
+ )
+ const AAA_LOEWNER_TOL = 100eps(T)
+ # Fixed-point startup on the normalized fitting curve.
