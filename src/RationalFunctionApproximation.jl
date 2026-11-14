@@ -32,6 +32,7 @@ export ArnoldiBasis, ArnoldiPolynomial, PartialFractions
 include("parfrac.jl")
 
 include("Quadratic_Thiele.jl")
+include("Quadratic_Thiele_full_pencil.jl")
 
 # legacy implementation of AAA
 export aaa

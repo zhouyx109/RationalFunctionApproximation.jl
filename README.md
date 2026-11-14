@@ -56,9 +56,14 @@ QTCF stores polynomial numerator and denominator blocks. Evaluation, derivatives
 poles and residues use these same stored coefficients; singleton storage delegates
 to Thiele's kernels. Values and derivatives use the backward block recurrence.
 Selected-node scalar and array values at common zeros use local polynomial factor cancellation.
-Pole extraction defaults to the unreduced denominator pencil;
-`poles(r; cancel_common=true)` removes confirmed common factors using the same
-pencil eigenvalues. Residues use the shared Thiele routine.
+Pole extraction uses the full scalar Thiele pencil or the manuscript QTCF block
+pencil. Both are unscaled and unrefined by default. For poles and residues,
+`scale=true` scales the rows and columns of both matrices before solving, and
+`refine=true` applies up to eight guarded Newton steps to each finite pole
+candidate. Scalar Thiele also accepts `compact=true`; it falls back to the
+full pencil when neither set of alternating pivots can be eliminated.
+`roots(r; scale=true)` enables scaling for numerator roots. Use
+`poles(r; finite_only=false)` to inspect all eigensolver values.
 Degree queries report nominal bounds propagated from the block sizes, as TCF
 does for one-point blocks; actual degrees may be lower.
 The experiments use `OneDiv` evaluation, `OneDiv` new-weight computation for TCF,

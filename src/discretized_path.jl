@@ -111,11 +111,16 @@ function add_node!(d::DiscretizedPath, idx)
     1 <= i <= length(d.next) && 1 <= j <= d.nref+1 ||
         throw(KeyError("Indicated new node is not in the discretization"))
     j == 1 && return
+    return _split_interval!(d, i, d.params[i, j])
+end
+
+# Split one interval at the supplied parameter and return the affected indexes.
+function _split_interval!(d::DiscretizedPath, i, s_new)
     n = length(d.next) + 1
     if n == size(d.points, 1)
         throw(MaxRefinementException("Cannot add more points to this discretization"))
     end
-    s_left, s_new = d.params[i, 1], d.params[i, j]
+    s_left = d.params[i, 1]
     succ = d.next[i]
     s_right = succ == 0 ? length(d.path) : d.params[succ, 1]
     δ_left = (s_new - s_left) / (1 + d.nref)

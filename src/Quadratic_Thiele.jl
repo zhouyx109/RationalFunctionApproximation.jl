@@ -5,7 +5,6 @@
 # ## 1. Types and accessors
 #
 # `_QTCFBlocks` stores blocks; `QuadraticThiele` uses Thiele storage for singletons.
-# `_QTCFChart` retains normalized polynomial factors at a selected common zero.
 # `nodes`, `values`, `degrees`, and `degree` support RFA results and display.
 # `convert` changes numeric type; `copy` saves snapshots; `isreal` checks coefficients.
 # `getproperty` builds continuants for polynomial queries.
@@ -14,28 +13,6 @@
 import Base: values
 
 export QuadraticThiele, QTCF, Symmetric, symmetric
-
-# %% _QTCFGroup — normalized polynomial transfer coefficients
-mutable struct _QTCFGroup{S}
-    head::Vector{S}
-    gamma::Vector{S}
-    center::S
-    complement::NTuple{3,S}
-    ratio::S
-    scale::S
-end
-
-struct _QTCFChart{S}
-    groups::Vector{_QTCFGroup{S}}
-end
-
-Base.copy(g::_QTCFGroup{S}) where {S} = _QTCFGroup{S}(
-    copy(g.head), copy(g.gamma), g.center, g.complement, g.ratio, g.scale)
-Base.copy(c::_QTCFChart{S}) where {S} = _QTCFChart{S}(copy.(c.groups))
-
-_convert_chart(::Type{S}, chart) where {S} = chart === nothing ? nothing :
-    _QTCFChart{S}([_QTCFGroup{S}(S.(g.head), S.(g.gamma), S(g.center),
-        S.(g.complement), S(g.ratio), S(g.scale)) for g in chart.groups])
 
 # %% _QTCFBlocks — block storage
 # QTCF-only storage: denominator coefficients are vectors, one per block.
@@ -68,17 +45,15 @@ end
 Quadratic Thiele representation, aliased as `QTCF`. Pass the empty selector to
 `approximate`, or construct from node-value data. `block_sizes` contains ones
 and twos (default: all ones); optional weights are constant or affine coefficient
-vectors, one per block. Singleton storage delegates to Thiele. When the first
-pair introduces a selected common zero, computed blocks use normalized polynomial
-transfer factors; expanded denominator weights remain available. Continuants are lazy.
+vectors, one per block. Singleton storage delegates to Thiele.
+Continuants are built lazily from the stored blocks.
 """
 mutable struct QuadraticThiele{T,S} <: AbstractRationalInterpolant{T,S}
     data::Union{Thiele{T,S},_QTCFBlocks{S}}
     polynomials::Union{Nothing,Tuple{Vector{S},Vector{S}}}
-    chart::Union{Nothing,_QTCFChart{S}}
 
-    function QuadraticThiele{T,S}(data, polynomials, chart=nothing) where {T<:AbstractFloat,S<:RealComplex{T}}
-        return new{T,S}(data, polynomials, chart)
+    function QuadraticThiele{T,S}(data, polynomials) where {T<:AbstractFloat,S<:RealComplex{T}}
+        return new{T,S}(data, polynomials)
     end
 end
 
@@ -100,8 +75,7 @@ function Base.convert(::Type{F}, r::QuadraticThiele{T,S}) where {F<:AbstractFloa
     V = S <: Real ? F : complex(F)
     data = _QTCFBlocks{V}(Tuple{V,V}.(d.pairs), [V.(b) for b in d.bpolys],
         [V.(a) for a in d.apolys], V.(d.nodes), V.(d.vals))
-    chart = _convert_chart(V, r.chart)
-    return QuadraticThiele{F,V}(data, nothing, chart)
+    return QuadraticThiele{F,V}(data, nothing)
 end
 
 # %% nodes
@@ -151,8 +125,7 @@ function Base.copy(r::QuadraticThiele{T,S}) where {T,S}
     data = d isa Thiele ? copy(d) : _QTCFBlocks{S}(
         copy(d.pairs), copy.(d.bpolys), copy.(d.apolys), copy(d.nodes), copy(d.vals))
     p = getfield(r, :polynomials)
-    return QuadraticThiele{T,S}(data, p === nothing ? nothing : copy.(p),
-        r.chart === nothing ? nothing : copy(r.chart))
+    return QuadraticThiele{T,S}(data, p === nothing ? nothing : copy.(p))
 end
 
 # %% Base.getproperty
@@ -161,9 +134,6 @@ end
     d = getfield(r, :data)
     if name === :P || name === :Q
         p = getfield(r, :polynomials)
-        if p === nothing && r.chart !== nothing
-            r.polynomials = p = _chart_polynomials(r)
-        end
         if p === nothing
             b, a = d isa Thiele ? (d.weights, d.nodes) : (d.bpolys, d.apolys)
             Pold, Qold = S[1], S[0]
@@ -180,7 +150,7 @@ end
         end
         return name === :P ? first(p) : last(p)
     end
-    name in (:data, :polynomials, :chart) && return getfield(r, name)
+    name in (:data, :polynomials) && return getfield(r, name)
     name === :values && (name = :vals)
     name === :weights && (name = :bpolys)
     if d isa Thiele
@@ -208,8 +178,6 @@ QuadraticThiele() = QuadraticThiele{Float64,Float64}(Thiele(), nothing)
 # and `_evaluate_classic` supply their block recurrences; `_evaluate_block` evaluates
 # one block. `_evaluate_common_zero` cancels a selected linear factor locally.
 # `_padd` and `_pmul` build continuants in `getproperty`.
-# `_chart_numden`, `_chart_evaluate!`, and `_chart_derivative!` evaluate the same
-# normalized transfer factors; `_chart_local_pair` cancels a selected linear factor.
 # `_evaluate_block_derivs` and `_evaluate_numden_derivs` supply polynomial
 # derivatives for `residues`; `_derivative!` supplies general quotient derivatives.
 
@@ -224,7 +192,7 @@ Infinity uses the nominal block degree bounds, as scalar Thiele uses node count.
 """
 function evaluate(r::QuadraticThiele, z::Number, method::ThieleMethod=default_eval_method())
     d = getfield(r, :data)
-    d isa Thiele && !isfinite(z) &&
+    d isa Thiele &&
         return convert(promote_type(eltype(r), typeof(z)), evaluate(d, z, method))
 
     # Resolve nonfinite inputs before entering the block recurrence.
@@ -239,23 +207,14 @@ function evaluate(r::QuadraticThiele, z::Number, method::ThieleMethod=default_ev
         return oftype(z, NaN)
     end
 
-    S = promote_type(eltype(r), typeof(z))
-    value = d isa Thiele ?
-        convert(S, evaluate(d, z, method)) : _evaluate(r, z, method)
-
-    # Cancel a selected common factor before evaluating the quotient.
-    if !isfinite(value) && any(==(z), nodes(r))
-        cancelled = _evaluate_common_zero(r, z)
-        cancelled === nothing || return cancelled
-    end
-    return value
+    return _evaluate_finite_thiele(r, z, method)
 end
 
 # %% evaluate — array
 # Promote stored coefficients with the query type.
 function evaluate(r::QuadraticThiele, z::AbstractArray{<:Number})
     t = similar(z, promote_type(eltype(r), eltype(z)))
-    return evaluate!(t, r, z)
+    return _evaluate_thiele_samples!(t, r, z, similar(t), similar(t), default_eval_method())
 end
 
 # %% evaluate! — allocate scratch
@@ -263,8 +222,8 @@ end
     evaluate!(t, r::QuadraticThiele, z, [a, b])
 
 Write evaluations into `t` using matching, nonoverlapping scratch arrays.
-The OneDiv array recurrence omits scalar underflow rescaling, as in Thiele.
-Selected common zeros use the same cancellation as scalar evaluation.
+With `fallback=true`, retry nonfinite results and small intermediate values
+through scalar OneDiv. Selected common zeros use scalar cancellation.
 """
 function evaluate!(
     t::AbstractArray, r::QuadraticThiele, z::AbstractArray{<:Number}
@@ -281,82 +240,61 @@ function evaluate!(
     )
     d = getfield(r, :data)
 
-    # Use the array pair recurrence without scalar underflow checks.
-    if r.chart !== nothing
-        _chart_evaluate!(t, r, z, a, b)
-    elseif d isa Thiele
-        evaluate!(t, d, z, a, b; fallback)
-    else
-        m = length(d.bpolys)
-        if m == 1
-            p, pair = d.bpolys[1], d.pairs[1]
-            if length(p) == 1
-                t .= p[1]
-            else
-                half = oftype(float(real(pair[1])), 0.5)
-                midpoint = half * pair[1] + half * pair[2]
-                value = p[1] + p[2] * midpoint
-                t .= value .+ p[2] .* (z .- midpoint)
-            end
+    d isa Thiele && return evaluate!(t, d, z, a, b; fallback)
+
+    retry = fallback ? fill!(similar(t, Bool), false) : nothing
+    m = length(d.bpolys)
+    if m == 1
+        p = d.bpolys[1]
+        if length(p) == 1
+            t .= p[1]
         else
-            p, pair = d.bpolys[m], d.pairs[m]
+            t .= p[1] .+ p[2] .* z
+        end
+    else
+        p = d.bpolys[m]
+        if length(p) == 1
+            a .= p[1]
+        else
+            a .= p[1] .+ p[2] .* z
+        end
+        p, pair = d.apolys[m-1], d.pairs[m-1]
+        if length(p) == 2
+            b .= p[2] .* (z .- pair[1])
+        else
+            b .= (p[3] .* (z .- pair[1])) .* (z .- pair[2])
+        end
+        _mark_thiele_underflow!(retry, a, b)
+        @inbounds for k in m-1:-1:2
+            p = d.bpolys[k]
             if length(p) == 1
-                a .= p[1]
+                b .= p[1] .* a .+ b
             else
-                half = oftype(float(real(pair[1])), 0.5)
-                midpoint = half * pair[1] + half * pair[2]
-                value = p[1] + p[2] * midpoint
-                a .= value .+ p[2] .* (z .- midpoint)
+                b .= (p[1] .+ p[2] .* z) .* a .+ b
             end
-            p, pair = d.apolys[m-1], d.pairs[m-1]
+            p, pair = d.apolys[k-1], d.pairs[k-1]
             if length(p) == 2
-                b .= p[2] .* (z .- pair[1])
+                a .*= p[2] .* (z .- pair[1])
             else
-                b .= (p[3] .* (z .- pair[1])) .* (z .- pair[2])
+                a .*= (p[3] .* (z .- pair[1])) .* (z .- pair[2])
             end
-            @inbounds for k in m-1:-1:2
-                p, pair = d.bpolys[k], d.pairs[k]
-                if length(p) == 1
-                    b .= p[1] .* a .+ b
-                else
-                    half = oftype(float(real(pair[1])), 0.5)
-                    midpoint = half * pair[1] + half * pair[2]
-                    value = p[1] + p[2] * midpoint
-                    b .= (value .+ p[2] .* (z .- midpoint)) .* a .+ b
-                end
-                p, pair = d.apolys[k-1], d.pairs[k-1]
-                if length(p) == 2
-                    a .*= p[2] .* (z .- pair[1])
-                else
-                    a .*= (p[3] .* (z .- pair[1])) .* (z .- pair[2])
-                end
-                a, b = b, a
-            end
-            p, pair = d.bpolys[1], d.pairs[1]
-            if length(p) == 1
-                t .= p[1] .+ b ./ a
-            else
-                half = oftype(float(real(pair[1])), 0.5)
-                midpoint = half * pair[1] + half * pair[2]
-                value = p[1] + p[2] * midpoint
-                t .= (value .+ p[2] .* (z .- midpoint)) .+ b ./ a
-            end
+            a, b = b, a
+            _mark_thiele_underflow!(retry, a, b)
+        end
+        p = d.bpolys[1]
+        if length(p) == 1
+            t .= p[1] .+ b ./ a
+        else
+            t .= (p[1] .+ p[2] .* z) .+ b ./ a
         end
     end
 
-    # Resolve exceptional inputs and selected common zeros.
-    @inbounds for i in eachindex(t, z)
-        (isinf(z[i]) || (!isfinite(t[i]) && any(==(z[i]), nodes(r))) ||
-            (fallback && (isnan(z[i]) || !isfinite(t[i])))) &&
-            (t[i] = evaluate(r, z[i], OneDiv()))
-    end
-    return t
+    return _finish_thiele_array!(t, r, z, retry)
 end
 
 # %% _evaluate_classic
 # Evaluate by the backward continued-fraction recurrence.
 function _evaluate_classic(r::QuadraticThiele, z::Number)
-    r.chart === nothing || return /( _chart_numden(r, z; classic=true)...)
     d = getfield(r, :data)
     d isa Thiele && return _evaluate_classic(d, z)
     m = length(d.bpolys)
@@ -372,7 +310,6 @@ end
 # Return the backward numerator/denominator pair with common scaling.
 function _evaluate_numden(r::QuadraticThiele, z::Number; underflow_guard=true)
     @assert isfinite(z)
-    r.chart === nothing || return _chart_numden(r, z; underflow_guard)
     d, S = getfield(r, :data), promote_type(eltype(r), typeof(z))
     if d isa Thiele
         return _evaluate_numden(d, z; underflow_guard)
@@ -396,231 +333,17 @@ function _evaluate_numden(r::QuadraticThiele, z::Number; underflow_guard=true)
     return A, B
 end
 
-# Evaluate the normalized head, tail coefficient, and anchored complement.
-@inline _chart_head(g, z) = length(g.head) == 1 ? g.head[1] : g.head[1] + g.head[2]*z
-@inline _chart_gamma(g, z) = length(g.gamma) == 1 ? g.gamma[1] : g.gamma[1] + g.gamma[2]*z
-@inline _chart_complement(g, z) = evalpoly(z - g.center, g.complement)
-
-# Return the final local pair and apply preceding polynomial transfer matrices.
-function _chart_numden(r::R, z; underflow_guard=true, classic=false) where {R<:QuadraticThiele}
-    groups, pairs = r.chart.groups, r.pairs
-    g = last(groups)
-    complete = !isempty(g.gamma)
-    P = complete ? _chart_complement(g, z) : _chart_head(g, z)
-    Q = complete ? _chart_gamma(g, z) : one(P)
-    classic && ((P, Q) = (_chart_divide(P, Q), one(Q)))
-    for k in length(groups)-1:-1:1
-        g = groups[k]
-        pair = pairs[2k]
-        a = pair[1] == pair[2] ? z - pair[1] : (z - pair[1]) * (z - pair[2])
-        if classic && isinf(P)
-            P, Q = _chart_divide(_chart_complement(g, z), _chart_gamma(g, z)), one(Q)
-            continue
-        end
-        P, Q = g.ratio * _chart_complement(g, z) * P + _chart_head(g, z) * a * Q,
-            g.ratio * _chart_gamma(g, z) * P + a * Q
-        if classic
-            P, Q = P / Q, one(Q)
-        elseif k > 1 && underflow_guard && guard(P)
-            P *= 1e100
-            Q *= 1e100
-        end
-    end
-    return P, Q
-end
-
-# Apply the OneDiv transfer chain with the native unscaled array policy.
-function _chart_evaluate!(out, r::R, z, a, b) where {R<:QuadraticThiele}
-    groups, pairs = r.chart.groups, r.pairs
-    g = last(groups)
-    if isempty(g.gamma)
-        h0, h1 = g.head[1], length(g.head)>1 ? g.head[2] : zero(eltype(a))
-        a .= h0 .+ h1 .* z
-        b .= one(eltype(b))
-    else
-        c0, c1, c2 = g.complement
-        gamma0, gamma1 = g.gamma[1], length(g.gamma)>1 ? g.gamma[2] : zero(eltype(a))
-        a .= c0 .+ (z .- g.center) .* (c1 .+ c2 .* (z .- g.center))
-        b .= gamma0 .+ gamma1 .* z
-    end
-    temp = out
-    for k in length(groups)-1:-1:1
-        g, pair = groups[k], pairs[2k]
-        c0, c1, c2 = g.complement
-        h0, h1 = g.head[1], length(g.head)>1 ? g.head[2] : zero(eltype(a))
-        gamma0, gamma1 = g.gamma[1], length(g.gamma)>1 ? g.gamma[2] : zero(eltype(a))
-        if pair[1] == pair[2]
-            temp .= g.ratio .* (c0 .+ (z .- g.center) .* (c1 .+ c2 .* (z .- g.center))) .* a .+
-                (h0 .+ h1 .* z) .* (z .- pair[1]) .* b
-            b .= g.ratio .* (gamma0 .+ gamma1 .* z) .* a .+ (z .- pair[1]) .* b
-        else
-            temp .= g.ratio .* (c0 .+ (z .- g.center) .* (c1 .+ c2 .* (z .- g.center))) .* a .+
-                (h0 .+ h1 .* z) .* ((z .- pair[1]) .* (z .- pair[2])) .* b
-            b .= g.ratio .* (gamma0 .+ gamma1 .* z) .* a .+
-                ((z .- pair[1]) .* (z .- pair[2])) .* b
-        end
-        a, temp = temp, a
-    end
-    out .= a ./ b
-    return out
-end
-
-# Differentiate the same polynomial transfer chain into caller-owned workspaces.
-function _chart_derivative!(z, r::R, order, A, B;
-    underflow_guard=true, normalize=false) where {R<:QuadraticThiele}
-    groups, pairs = r.chart.groups, r.pairs
-    g = last(groups)
-    complete = !isempty(g.gamma)
-    fill!(A, 0); fill!(B, 0)
-    if complete
-        A[1], B[1] = _chart_complement(g, z), _chart_gamma(g, z)
-        order >= 1 && (A[2] = g.complement[2] + 2g.complement[3] * (z - g.center);
-            B[2] = length(g.gamma) > 1 ? g.gamma[2] : zero(z))
-        order >= 2 && (A[3] = 2g.complement[3])
-    else
-        A[1], B[1] = _chart_head(g, z), one(z)
-        order >= 1 && length(g.head) > 1 && (A[2] = g.head[2])
-    end
-    if normalize
-        scale = max(one(abs(z)), maximum(abs, A), maximum(abs, B))
-        A ./= scale; B ./= scale
-    end
-    for k in length(groups)-1:-1:1
-        g, pair = groups[k], pairs[2k]
-        singleton = pair[1] == pair[2]
-        a = singleton ? z - pair[1] : (z - pair[1]) * (z - pair[2])
-        a1 = singleton ? one(z) : (z - pair[1]) + (z - pair[2])
-        a2 = singleton ? zero(z) : oftype(z, 2)
-        h, h1 = _chart_head(g, z), length(g.head) > 1 ? g.head[2] : zero(z)
-        c, c1, c2 = _chart_complement(g, z),
-            g.complement[2] + 2g.complement[3] * (z - g.center), 2g.complement[3]
-        gamma, gamma1 = _chart_gamma(g, z), length(g.gamma) > 1 ? g.gamma[2] : zero(z)
-        M11 = (g.ratio*c, g.ratio*c1, g.ratio*c2, zero(z))
-        M12 = (h*a, h1*a+h*a1, 2h1*a1+h*a2, 3h1*a2)
-        M21 = (g.ratio*gamma, g.ratio*gamma1, zero(z), zero(z))
-        M22 = (a, a1, a2, zero(z))
-        for q in order:-1:0
-            p, d = zero(eltype(A)), zero(eltype(B))
-            for s in 0:min(q, 3)
-                choose = binomial(q, s)
-                p += choose * (M11[s+1] * A[q-s+1] + M12[s+1] * B[q-s+1])
-                d += choose * (M21[s+1] * A[q-s+1] + M22[s+1] * B[q-s+1])
-            end
-            A[q+1], B[q+1] = p, d
-        end
-        if normalize
-            scale = max(one(abs(z)), maximum(abs, A), maximum(abs, B))
-            A ./= scale; B ./= scale
-        end
-        if k > 1 && underflow_guard && any(guard, A)
-            A .*= 1e50
-            B .*= 1e50
-        end
-    end
-    return A, B
-end
-
-# Expand the anchored complement only for polynomial and pencil construction.
-function _chart_coefficients(g)
-    c0, c1, c2 = g.complement
-    return [c0 - g.center*c1 + g.center^2*c2, c1 - 2g.center*c2, c2]
-end
-
-# Expand the transfer chain into continuants without cancelling common factors.
-function _chart_polynomials(r::QuadraticThiele)
-    groups, a = r.chart.groups, r.apolys
-    S = eltype(r)
-    g = last(groups)
-    P, Q = isempty(g.gamma) ? (copy(g.head), S[1]) :
-        (_chart_coefficients(g), copy(g.gamma))
-    for k in length(groups)-1:-1:1
-        g, ak = groups[k], a[2k]
-        P, Q = _padd(_pmul(g.ratio .* _chart_coefficients(g), P),
-                _pmul(_pmul(g.head, ak), Q)),
-            _padd(_pmul(g.ratio .* g.gamma, P), _pmul(ak, Q))
-    end
-    return P, Q
-end
-
-# Retain constant and linear local coefficients for exact selected-factor cancellation.
-function _chart_local_pair(r::R, z) where {R<:QuadraticThiele}
-    groups, pairs = r.chart.groups, r.pairs
-    g = last(groups)
-    complete = !isempty(g.gamma)
-    p0 = complete ? _chart_complement(g, z) : _chart_head(g, z)
-    p1 = complete ? g.complement[2]+2g.complement[3]*(z-g.center) :
-        length(g.head) > 1 ? g.head[2] : zero(z)
-    q0 = complete ? _chart_gamma(g, z) : one(z)
-    q1 = complete && length(g.gamma) > 1 ? g.gamma[2] : zero(z)
-    for k in length(groups)-1:-1:1
-        g, pair = groups[k], pairs[2k]
-        a = _chart_a(pair, z)
-        a1 = pair[1] == pair[2] ? one(z) : (z-pair[1])+(z-pair[2])
-        h, h1 = _chart_head(g, z), length(g.head)>1 ? g.head[2] : zero(z)
-        c, c1 = _chart_complement(g, z), g.complement[2]+2g.complement[3]*(z-g.center)
-        gamma, gamma1 = _chart_gamma(g, z), length(g.gamma)>1 ? g.gamma[2] : zero(z)
-        p0, p1, q0, q1 = g.ratio*c*p0+h*a*q0,
-            g.ratio*(c*p1+c1*p0)+h*a*q1+(h1*a+h*a1)*q0,
-            g.ratio*gamma*p0+a*q0,
-            g.ratio*(gamma*p1+gamma1*p0)+a*q1+a1*q0
-        if k > 1 && (guard(p0) || guard(p1))
-            p0 *= 1e50; p1 *= 1e50; q0 *= 1e50; q1 *= 1e50
-        end
-    end
-    return p0, p1, q0, q1
-end
-
 # %% _evaluate_common_zero
 # Divide a selected common factor out of the local lower-tail polynomials.
 function _evaluate_common_zero(r::QuadraticThiele, z)
-    if r.chart !== nothing
-        S = promote_type(eltype(r), typeof(z))
-        p0, p1, q0, q1 = _chart_local_pair(r, S(z))
-        iszero(p0) && iszero(q0) && all(isfinite, (p1, q1)) &&
-            !(iszero(p1) && iszero(q1)) || return nothing
-        return p1 / q1
-    end
     pairs, b, a = r.pairs, r.bpolys, r.apolys
     j = findfirst(pair -> z == first(pair) || z == last(pair), pairs)
     m = length(b)
     (j === nothing || j == m) && return nothing
     S = promote_type(eltype(r), typeof(z))
-
-    # Retain the constant and linear coefficients in u=t-z of the lower tail.
-    p0 = S(_evaluate_block(b[m], pairs[m], z))
-    p1 = length(b[m]) == 1 ? zero(S) : S(b[m][2])
-    q0, q1 = one(S), zero(S)
-    for k in m-1:-1:j+1
-        b0 = _evaluate_block(b[k], pairs[k], z)
-        b1 = length(b[k]) == 1 ? zero(S) : b[k][2]
-        a0 = _evaluate_block(a[k], pairs[k], z; numerator=true)
-        a1 = length(a[k]) == 2 ? a[k][2] :
-            a[k][3] * ((z - pairs[k][1]) + (z - pairs[k][2]))
-        p0, p1, q0, q1 = b0 * p0 + a0 * q0,
-            b0 * p1 + b1 * p0 + (a0 * q1 + a1 * q0), p0, p1
-        if guard(p0) || guard(p1)
-            p0 *= 1e50
-            p1 *= 1e50
-            q0 *= 1e50
-            q1 *= 1e50
-        end
-    end
-    iszero(p0) && isfinite(q0) && !iszero(q0) && isfinite(p1) || return nothing
-
-    # Divide the vanishing lower numerator and a_j by u, then resume backward.
-    pair = pairs[j]
-    factor = length(a[j]) == 2 ? a[j][2] :
-        a[j][3] * (z - (z == first(pair) ? last(pair) : first(pair)))
-    P, Q = _evaluate_block(b[j], pair, z) * p1 + factor * q0, p1
-    for k in j-1:-1:1
-        P, Q = _evaluate_block(b[k], pairs[k], z) * P +
-            _evaluate_block(a[k], pairs[k], z; numerator=true) * Q, P
-        if k > 1 && guard(P)
-            P *= 1e100
-            Q *= 1e100
-        end
-    end
-    return all(isfinite, (P, Q)) && !(iszero(P) && iszero(Q)) ? P / Q : nothing
+    bjet = k -> _evaluate_block_derivs(b[k], pairs[k], z)
+    ajet = k -> _evaluate_block_derivs(a[k], pairs[k], z; numerator=true)
+    return _cancel_thiele_factor(S, j, m, bjet, ajet)
 end
 
 # %% _evaluate_block
@@ -630,13 +353,7 @@ end
         return length(p) == 2 ? p[2] * (z - pair[1]) :
             p[3] * (z - pair[1]) * (z - pair[2])
     end
-    length(p) == 1 && return only(p)
-
-    # Center affine evaluation on the interpolation pair.
-    half = oftype(float(real(pair[1])), 0.5)
-    midpoint = half * pair[1] + half * pair[2]
-    midpoint_value = p[1] + p[2] * midpoint
-    return midpoint_value + p[2] * (z - midpoint)
+    return length(p) == 1 ? only(p) : p[1] + p[2] * z
 end
 
 # %% _padd
@@ -673,100 +390,67 @@ end
     return c * (z - z1) * (z - z2), c * ((z - z1) + (z - z2)), 2c
 end
 
-# %% _derivative! — workspace and quotient recovery
-# Fill numerator/denominator derivatives and recover vals with one reciprocal.
-function _derivative!(
-    z, r::QuadraticThiele, order::Integer,
-    A::AbstractVector, B::AbstractVector, vals::AbstractVector;
-    underflow_guard=true, quotient=true, normalize=false
-    )
+# %% _thiele_jets! — block derivatives
+# Fill numerator and denominator derivatives for the shared quotient routine.
+function _thiele_jets!(z, r::QuadraticThiele, order, A, B)
     n = order + 1
     d, S = getfield(r, :data), promote_type(eltype(r), typeof(z))
-    if r.chart !== nothing
-        _chart_derivative!(z, r, order, A, B; underflow_guard, normalize)
-    elseif d isa Thiele
-        _derivative!(z, d.weights, d.nodes, order, A, B, vals;
-            underflow_guard, quotient=false)
-    else
-        # Seed the final block, then differentiate backward in descending order.
-        m = length(d.bpolys)
-        fill!(view(A, 1:n), 0); fill!(view(B, 1:n), 0)
-        bjet = _evaluate_block_derivs(d.bpolys[m], d.pairs[m], z)
-        ajet = m > 1 ? _evaluate_block_derivs(d.apolys[m-1], d.pairs[m-1], z;
-            numerator=true) : (one(S), zero(S), zero(S))
-        for q in 0:min(order, 2)
-            A[q+1], B[q+1] = bjet[q+1], ajet[q+1]
-        end
-        if normalize
-            scale = max(one(abs(z)), maximum(abs, view(A, 1:n)),
-                maximum(abs, view(B, 1:n)))
-            view(A, 1:n) ./= scale; view(B, 1:n) ./= scale
-        end
-
-        for k in m-1:-1:1
-            block = d.bpolys[k]
-            bjet = _evaluate_block_derivs(block, d.pairs[k], z)
-            a = k > 1 ? d.apolys[k-1] : nothing
-            ajet = k > 1 ? _evaluate_block_derivs(a, d.pairs[k-1], z; numerator=true) : nothing
-            for q in order:-1:0
-                value = bjet[1] * A[q+1]
-                q > 0 && length(block) > 1 && (value += q * bjet[2] * A[q])
-                value += B[q+1]
-                next_B = A[q+1]
-                if k > 1
-                    next_B = ajet[1] * A[q+1]
-                    q > 0 && (next_B += q * ajet[2] * A[q])
-                    q > 1 && length(a) > 2 &&
-                        (next_B += (q * (q - 1) ÷ 2) * ajet[3] * A[q-1])
-                end
-                A[q+1], B[q+1] = value, next_B
-            end
-            if normalize
-                scale = max(one(abs(z)), maximum(abs, view(A, 1:n)),
-                    maximum(abs, view(B, 1:n)))
-                view(A, 1:n) ./= scale; view(B, 1:n) ./= scale
-            end
-            if k > 1 && underflow_guard && any(guard, view(A, 1:n))
-                view(A, 1:n) .*= 1e50
-                view(B, 1:n) .*= 1e50
-            end
-        end
+    d isa Thiele && return _thiele_jets!(z, d, order, A, B)
+    m = length(d.bpolys)
+    fill!(view(A, 1:n), 0)
+    fill!(view(B, 1:n), 0)
+    bjet = _evaluate_block_derivs(d.bpolys[m], d.pairs[m], z)
+    ajet = m > 1 ? _evaluate_block_derivs(d.apolys[m-1], d.pairs[m-1], z;
+        numerator=true) : (one(S), zero(S), zero(S))
+    for q in 0:min(order, 2)
+        A[q+1], B[q+1] = bjet[q+1], ajet[q+1]
     end
-    quotient || return A, B
-
-    # Divide the local Taylor coefficients by a selected simple common factor.
-    if iszero(A[1]) && iszero(B[1]) && any(==(z), nodes(r))
-        _derivative!(z, r, order+1, A, B, vals; underflow_guard, quotient=false)
-        if all(isfinite, (A[2], B[2])) && !(iszero(A[2]) && iszero(B[2]))
-            for q in 0:order
-                A[q+1], B[q+1] = A[q+2]/(q+1), B[q+2]/(q+1)
+    for k in m-1:-1:1
+        block = d.bpolys[k]
+        bjet = _evaluate_block_derivs(block, d.pairs[k], z)
+        a = k > 1 ? d.apolys[k-1] : nothing
+        ajet = k > 1 ? _evaluate_block_derivs(a, d.pairs[k-1], z; numerator=true) : nothing
+        for q in order:-1:0
+            value = bjet[1] * A[q+1]
+            q > 0 && length(block) > 1 && (value += q * bjet[2] * A[q])
+            value += B[q+1]
+            next_B = A[q+1]
+            if k > 1
+                next_B = ajet[1] * A[q+1]
+                q > 0 && (next_B += q * ajet[2] * A[q])
+                q > 1 && length(a) > 2 &&
+                    (next_B += (q * (q - 1) ÷ 2) * ajet[3] * A[q-1])
             end
+            A[q+1], B[q+1] = value, next_B
         end
+        k > 1 && _guard_thiele_jets!(view(A, 1:n), view(B, 1:n))
     end
-
-    # Recover all quotient derivatives with one reciprocal.
-    inv_denom = inv(B[1])
-    vals[1] = A[1] * inv_denom
-    for q in 1:order
-        correction = zero(eltype(vals))
-        for j in 1:q
-            correction += binomial(q, j) * B[j+1] * vals[q-j+1]
-        end
-        vals[q+1] = (A[q+1] - correction) * inv_denom
-    end
-    return vals
+    return nothing
 end
 
 # %% _evaluate_numden_derivs
 # Return commonly normalized numerator/denominator jets for residues.
-function _evaluate_numden_derivs(r::QuadraticThiele, z::Number, space=nothing)
+function _evaluate_numden_derivs(r::QuadraticThiele, z::Number)
     d = getfield(r, :data)
     d isa Thiele && return _evaluate_numden_derivs(d, z)
-    S = promote_type(eltype(r), typeof(z))
-    A, B = space === nothing ?
-        ntuple(_ -> Vector{S}(undef, 2), 2) : space
-    _derivative!(z, r, 1, A, B, A; underflow_guard=false, quotient=false, normalize=true)
-    return S(A[1]), S(B[1]), S(A[2]), S(B[2])
+    m = length(d.bpolys)
+    a, aʹ, _ = _evaluate_block_derivs(d.bpolys[m], d.pairs[m], z)
+    m == 1 && return a, one(a), aʹ, zero(a)
+    b, bʹ, _ = _evaluate_block_derivs(d.apolys[m-1], d.pairs[m-1], z; numerator=true)
+    a, b, aʹ, bʹ = _normalize_residue_jets(z, a, b, aʹ, bʹ)
+    @inbounds for k in m-1:-1:2
+        c, cʹ, _ = _evaluate_block_derivs(d.bpolys[k], d.pairs[k], z)
+        e, eʹ, _ = _evaluate_block_derivs(d.apolys[k-1], d.pairs[k-1], z; numerator=true)
+        t = cʹ * a + c * aʹ + bʹ
+        bʹ = eʹ * a + e * aʹ
+        aʹ = t
+        t = c * a + b
+        b = a * e
+        a = t
+        a, b, aʹ, bʹ = _normalize_residue_jets(z, a, b, aʹ, bʹ)
+    end
+    c, cʹ, _ = _evaluate_block_derivs(d.bpolys[1], d.pairs[1], z)
+    return c * a + b, a, cʹ * a + c * aʹ + bʹ, aʹ
 end
 
 # %% derivative — single order
@@ -786,165 +470,66 @@ end
 
 # %% derivative — requested orders
 # Return requested derivatives, reusing captured workspaces.
-function derivative(r::QuadraticThiele, orders::AbstractVector{<:Integer})
-    isempty(orders) && throw(ArgumentError("at least one derivative order is required"))
-    all(>=(0), orders) || throw(ArgumentError("derivative orders must be nonnegative"))
-    order, index = maximum(orders), 1 .+ orders
-    A = Vector{complex(eltype(r))}(undef, order + 2)
-    B = similar(A)
-    vals = similar(A, order + 1)
-    return function(z)
-        _derivative!(z, r, order, A, B, vals)
-        result = vals[index]
-        return isreal(z) && isreal(r) ? real(result) : result
-    end
-end
+derivative(r::QuadraticThiele, orders::AbstractVector{<:Integer}) = _thiele_derivative(r, orders)
 
 # %% [markdown]
-# ## 3. Poles, roots, residues, and partial fractions
+# ## 3. Poles, roots, and residues
 #
 # `roots` and `poles` assemble the numerator and denominator matrix pencils.
-# Normalized transfer factors use their polynomial companion pencil.
-# `cancel_common` optionally removes confirmed common factors from the pencil roots.
 # `residues` reuses RFA's residue loop with `_evaluate_numden_derivs`.
-# `convert(PartialFractions, r)` uses the shared root/residue matching construction.
 
 # %% poles
 """
-    poles(r::QuadraticThiele; cancel_common=false)
+    poles(r::QuadraticThiele; full_pencil=false, scale=false, refine=false, finite_only=true)
 
-Return finite roots of the unreduced denominator pencil, as for Thiele.
-Set `cancel_common=true` to remove confirmed selected common factors.
+Return finite roots of the unreduced denominator from the manuscript pencil
+`K_m = C_m + t D_m`, with one row per block after the first, solved as the generalized
+eigenvalue problem `-C_m v = λ D_m v` with no scaling and no refinement.
+`full_pencil` is accepted for compatibility and uses the same pencil.
+`scale=true` and `refine=true` are opt-in departures from the manuscript: joint
+power-of-two row and column scaling before the solve, and Newton correction after it.
+Set `finite_only=false` to return every eigensolver value, including Inf and NaN.
 """
-poles(r::QuadraticThiele; cancel_common=false) = roots(r, 2; cancel_common)
-
-# Build a regular companion pencil for a polynomial in the transfer representation.
-function _chart_polynomial_pencil(p)
-    n = something(findlast(!iszero, p), 1) - 1
-    S = eltype(p)
-    C, D = zeros(S, n, n), zeros(S, n, n)
-    for j in 1:n-1
-        C[j,j+1], D[j,j] = -one(S), one(S)
-    end
-    if n > 0
-        C[n,:] .= view(p, 1:n)
-        D[n,n] = p[n+1]
-    end
-    return C, D
+function poles(r::QuadraticThiele; full_pencil=false, scale::Bool=false, refine::Bool=false,
+    finite_only=true)
+    C, D = _qtcf_block_pencil(r, 2)
+    isempty(C) && return eltype(r)[]
+    return _thiele_pencil_values(r, -C, D; scale, refine, finite_only)
 end
 
 # %% roots
 """
-    roots(r::QuadraticThiele, first_block=1; cancel_common=false)
+    roots(r::QuadraticThiele, first_block=1; scale=false, finite_only=true)
 
 Return finite numerator (`first_block=1`) or denominator (`first_block=2`) roots.
-Both cases use an unreduced matrix pencil. Normalized transfer factors use a
-companion pencil of their continuants. With `cancel_common=true`, remove one root for each confirmed selected common factor.
+Both cases use the unreduced manuscript pencil with no scaling; `scale=true` opts in
+to row and column scaling.
 """
-function roots(r::QuadraticThiele, first_block::Integer=1; cancel_common=false)
-    data = getfield(r, :data)
-    if r.chart !== nothing
-        p = first_block == 1 ? r.P : r.Q
-        C, D = _chart_polynomial_pencil(p)
-        isempty(C) && return eltype(r.nodes)[]
-        z = try
-            filter(isfinite, eigvals(-C, D))
-        catch
-            _, _, _, _, alpha, beta = schur(complex(-C), complex(D))
-            filter(isfinite, alpha ./ beta)
-        end
-        return cancel_common ? _cancel_common_roots!(z, r) : z
-    elseif data isa Thiele
-        z = first_block == 2 ? poles(data) : roots(data)
-        return cancel_common ? _cancel_common_roots!(z, r) : z
-    end
-    bpolys, apolys, pairs = r.bpolys, r.apolys, r.pairs
-
-    # Assemble the constant and linear parts of the block matrix pencil.
-    S = promote_type(eltype(r), eltype(r.nodes))
-    n = max(length(bpolys) - first_block + 1, 0)
-    C, D = zeros(S, n, n), zeros(S, n, n)
-    for j in 1:n
-        k = j + first_block - 1
-        b = bpolys[k]
-        C[j, j] += S(b[1])
-        length(b) >= 2 && (D[j, j] += S(b[2]))
-
-        # Split each numerator block across the two adjacent off-diagonals.
-        if j >= 2
-            a = apolys[k-1]
-            if length(a) <= 2
-                C[j-1, j] += S(a[1])
-                length(a) == 2 && (D[j-1, j] += S(a[2]))
-                C[j, j-1] += -one(S)
-            else
-                z1, z2 = S.(pairs[k-1])
-                C[j-1, j] += -z1
-                D[j-1, j] += one(S)
-                C[j, j-1] += z2
-                D[j, j-1] += -one(S)
-            end
-        end
-    end
-
-    # Extract finite eigenvalues, with a complex Schur fallback.
-    isempty(C) && return eltype(r.nodes)[]
-
-    z = try
-        filter(isfinite, eigvals(-C, D))
-    catch
-        _, _, _, _, α, β = schur(complex(-C), complex(D))
-        filter(isfinite, α ./ β)
-    end
-    return cancel_common ? _cancel_common_roots!(z, r) : z
-end
-
-# %% _cancel_common_roots!
-# Remove the pencil eigenvalue associated with each confirmed common factor.
-function _cancel_common_roots!(z, r::QuadraticThiele)
-    for node in nodes(r)
-        isempty(z) && break
-        _evaluate_common_zero(r, node) === nothing && continue
-        deleteat!(z, argmin(abs.(z .- node)))
-    end
-    return z
+function roots(r::QuadraticThiele, first_block::Integer=1; scale::Bool=false, finite_only=true)
+    C, D = _qtcf_block_pencil(r, first_block)
+    isempty(C) && return eltype(r)[]
+    return _thiele_pencil_values(r, -C, D; scale, refine=false, finite_only)
 end
 
 # %% residues
 """
-    residues(r::QuadraticThiele; cancel_common=false, check_finite=false, radius=nothing)
+    residues(r::QuadraticThiele; check_finite=false, radius=nothing,
+        full_pencil=false, scale=false, refine=false)
 
 Return poles and residues using the shared TCF residue loop.
 """
-function residues(r::QuadraticThiele; cancel_common=false, check_finite=false, radius=nothing)
-    z = poles(r; cancel_common)
-    if isempty(z) || getfield(r, :data) isa Thiele
-        return residues(r, z; check_finite, radius)
-    end
-    S = promote_type(eltype(r), eltype(z))
-    space = (Vector{S}(undef, 2), Vector{S}(undef, 2))
-    numden = (r, z) -> _evaluate_numden_derivs(r, z, space)
-    return residues(r, z; check_finite, radius, numden)
-end
-
-# %% Base.convert — partial fractions
-"""
-    convert(PartialFractions, r::QuadraticThiele)
-
-Convert a QTCF with simple computed poles to polynomial-plus-partial-fraction form.
-"""
-Base.convert(::Type{PartialFractions}, r::QuadraticThiele) = _partial_fractions(r)
-
-_polynomial_degree(r::QuadraticThiele) = something(findlast(!iszero, r.P), 1) - 1
+residues(r::QuadraticThiele; check_finite=false, radius=nothing, full_pencil=false,
+    scale::Bool=false, refine::Bool=false) =
+    residues(r, poles(r; full_pencil, scale, refine); check_finite, radius)
 
 # %% [markdown]
 # ## 4. Data construction, node updates, and blocks
 #
 # Constructors and `add_node!` reuse `_new_weight` for reduced values and
 # `_qtcf_append_block!` for storage.
-# The shared approximation engine calls `add_node!` for every sampling adapter.
+# Both approximation methods call `add_node!` for block construction.
 # `_block_line` fits denominator coefficients; `_factor_poly` forms numerators.
-# `_qtcf_from_blocks` also supports numeric conversion and arithmetic.
+# `_qtcf_from_blocks` wraps the blocks returned by arithmetic operations.
 
 # %% QuadraticThiele — typed construction
 """
@@ -1025,18 +610,10 @@ function QuadraticThiele(
 end
 
 # %% _qtcf_from_blocks
-# Wrap owned arrays in scalar storage when possible, otherwise in block storage.
-function _qtcf_from_blocks(pairs, bpolys, apolys, z::Vector{S}, y, chart=nothing) where {S}
-    scalar = !isempty(z) && length(z) == length(pairs) == length(bpolys) == length(apolys) &&
-        all(eachindex(z)) do j
-            pairs[j][1] == pairs[j][2] == z[j] && length(bpolys[j]) == 1 &&
-                isfinite(only(bpolys[j])) && length(apolys[j]) == 2 &&
-                apolys[j][1] == -z[j] && apolys[j][2] == 1
-        end
-
-    data = scalar ? Thiele(z, y, S[only(b) for b in bpolys]) :
-        _QTCFBlocks{S}(pairs, bpolys, apolys, z, y)
-    return QuadraticThiele{real_type(S),S}(data, nothing, chart)
+# Wrap owned block arrays returned by arithmetic operations.
+function _qtcf_from_blocks(pairs, bpolys, apolys, z::Vector{S}, y) where {S}
+    data = _QTCFBlocks{S}(pairs, bpolys, apolys, z, y)
+    return QuadraticThiele{real_type(S),S}(data, nothing)
 end
 
 # %% add_node! — scalar node
@@ -1060,14 +637,7 @@ function add_node!(
     h = _new_weight(method, r, z, y)
     isnan(h) && throw(NaNException("Adding QTCF block caused NaN reduced value"))
     isfinite(h) || throw(ArgumentError("QTCF block reduced values must be finite"))
-    chart = r.chart === nothing ? nothing : copy(r.chart)
-    if chart !== nothing
-        update = _chart_append!(chart, r.pairs, (z, z), (y, y), method)
-        update === nothing && throw(ArgumentError("QTCF block weights must be finite"))
-        h = first(first(update))
-    end
     _qtcf_append_block!(r, (z,), (y,), (h,))
-    r.chart = chart
     return r
 end
 
@@ -1087,7 +657,7 @@ function add_node!(
     all(isfinite, z) || throw(ArgumentError("interpolation nodes must be finite"))
     all(isfinite, y) || throw(ArgumentError("QTCF block target values must be finite"))
 
-    (_same(first(z), last(z)) || any(in(nodes(r)), z)) &&
+    (first(z) == last(z) || any(in(nodes(r)), z)) &&
         throw(ArgumentError("interpolation nodes must be distinct"))
 
     # Reduce both values against the current approximant before fitting the block.
@@ -1096,17 +666,7 @@ function add_node!(
     all(isfinite, h) || throw(ArgumentError("QTCF block reduced values must be finite"))
 
     b = _block_line(first(z), first(h), last(z), last(h))
-    chart = r.chart === nothing && length(r.bpolys) == 1 &&
-        first(r.pairs)[1] == first(r.pairs)[2] &&
-        iszero(_evaluate_block(b, (first(z), last(z)), first(r.nodes))) ? _chart_start(eltype(r), first(r.vals)) :
-        r.chart === nothing ? nothing : copy(r.chart)
-    if chart !== nothing
-        update = _chart_append!(chart, r.pairs, (first(z), last(z)), (first(y), last(y)), method)
-        update === nothing && throw(ArgumentError("QTCF block weights must be finite"))
-        b = first(update)
-    end
     _qtcf_append_block!(r, z, y, b)
-    r.chart = chart
     return r
 end
 
@@ -1142,187 +702,10 @@ function _qtcf_append_block!(r::QuadraticThiele, z, y, b)
     return r
 end
 
-# Initialize the singleton head without changing its target value.
-function _chart_start(::Type{S}, value) where {S}
-    g = _QTCFGroup{S}(S[value], S[], zero(S),
-        (zero(S), zero(S), zero(S)), one(S), one(S))
-    return _QTCFChart{S}([g])
-end
-
-# Evaluate the monic numerator associated with a stored node block.
-@inline _chart_a(pair, z) = pair[1] == pair[2] ?
-    z - pair[1] : (z - pair[1]) * (z - pair[2])
-
-# Use the native extended-complex convention at an exact zero denominator.
-@inline function _chart_divide(n, d)
-    S = promote_type(typeof(n), typeof(d))
-    iszero(d) && return convert(S, iszero(n) ? NaN : Inf)
-    isinf(n) && isfinite(d) && return convert(S, Inf)
-    return n / d
-end
-
-# Use ordinary Classic reductions for the first two blocks.
-function _chart_first_two(chart, pairs, z, y)
-    first = chart.groups[1]
-    u = _chart_divide(_chart_a(pairs[1], z), y - _chart_head(first, z))
-    return _chart_divide(_chart_a(pairs[2], z), u - _chart_gamma(first, z))
-end
-
-# Return h_{2k-2}/S_{2k-1}, the input to a normalized odd head.
-function _chart_input(chart, pairs, z, y, k)
-    k == 1 && return y
-    u = _chart_divide(_chart_first_two(chart, pairs, z, y), chart.groups[1].ratio)
-    for index in 2:k-1
-        g = chart.groups[index]
-        a = _chart_a(pairs[2index], z)
-        B = _chart_head(g, z)
-        u = isfinite(u) ? _chart_divide(a * (u - B),
-            g.ratio * (_chart_complement(g, z) - _chart_gamma(g, z) * u)) :
-            _chart_divide(_chart_divide(a,
-                _chart_divide(_chart_a(pairs[2index-1], z), u-B) - _chart_gamma(g, z)),
-                g.ratio)
-    end
-    return u
-end
-
-# Apply prior groups to a homogeneous reduced-value pair.
-function _chart_input_pair(chart, pairs, z, y, k)
-    U, V = y, one(y)
-    for index in 1:k-1
-        g = chart.groups[index]
-        a = _chart_a(pairs[2index], z)
-        U, V = a * (U - _chart_head(g, z) * V),
-            g.ratio * (_chart_complement(g, z) * V - _chart_gamma(g, z) * U)
-    end
-    return U, V
-end
-
-# Return the current reduction scaled by the last odd-head scale.
-function _chart_last_reduced(chart, pairs, z, y, method::ThieleMethod=Classic())
-    k = length(chart.groups)
-    if method isa OneDiv
-        g = chart.groups[k]
-        U, V = _chart_input_pair(chart, pairs, z, y, k)
-        return _chart_divide(_chart_a(pairs[2k], z) * (U - _chart_head(g, z) * V),
-            _chart_complement(g, z) * V - _chart_gamma(g, z) * U)
-    end
-    k == 1 && return _chart_first_two(chart, pairs, z, y)
-    g = chart.groups[k]
-    u = _chart_input(chart, pairs, z, y, k)
-    a = _chart_a(pairs[2k], z)
-    B = _chart_head(g, z)
-    return isfinite(u) ? _chart_divide(a * (u-B),
-        _chart_complement(g, z) - _chart_gamma(g, z)*u) :
-        _chart_divide(a, _chart_divide(_chart_a(pairs[2k-1], z), u-B) -
-            _chart_gamma(g, z))
-end
-
-# Complete or append one group and return canonical coefficients and reduced data.
-# Existing pairs do not yet include newpair. A rejected update leaves the chart intact.
-function _chart_append!(chart::_QTCFChart{S}, pairs, newpair, targets,
-    method::ThieleMethod=default_weight_method()) where {S}
-    x, y = S(newpair[1]), S(newpair[2])
-    fx, fy = S(targets[1]), S(targets[2])
-    all(isfinite, (fx, fy)) || return nothing
-    singleton = x == y
-    count = length(pairs)
-    last = chart.groups[end]
-    if iseven(count)
-        # The next odd head is normalized relative to the preceding odd head.
-        hx = _chart_last_reduced(chart, pairs, x, fx, method)
-        hy = _chart_last_reduced(chart, pairs, y, fy, method)
-        scaled = S.(_block_line(x, hx, y, hy))
-        leading = findlast(!iszero, scaled)
-        ratio = leading === nothing ? one(S) : scaled[leading]
-        B = scaled ./ ratio
-        resize!(B, leading === nothing ? 1 : leading)
-        scale = last.scale * ratio
-        coefficients = last.scale .* scaled
-        reduced = (last.scale * hx, last.scale * hy)
-        all(isfinite, (ratio, scale, reduced..., B..., coefficients...)) || return nothing
-        last.ratio = ratio
-        push!(chart.groups, _QTCFGroup{S}(B, S[], zero(S),
-            (zero(S), zero(S), zero(S)), one(S), scale))
-        return coefficients, reduced
-    end
-
-    # A new even block closes the pending normalized odd head.
-    k = length(chart.groups)
-    bx, by = _chart_head(last, x), _chart_head(last, y)
-    ax, ay = _chart_a(pairs[end], x), _chart_a(pairs[end], y)
-    if method isa OneDiv
-        ux, vx = _chart_input_pair(chart, pairs, x, fx, k)
-        uy, vy = _chart_input_pair(chart, pairs, y, fy, k)
-        invx = _chart_divide(one(S), ux - bx * vx)
-        invy = _chart_divide(one(S), uy - by * vy)
-        gx, gy = ax * (vx * invx), ay * (vy * invy)
-        cx, cy = ax * (ux * invx), ay * (uy * invy)
-    else
-        vx = _chart_input(chart, pairs, x, fx, k)
-        vy = _chart_input(chart, pairs, y, fy, k)
-        gx, gy = _chart_divide(ax, vx-bx), _chart_divide(ay, vy-by)
-        cx, cy = isinf(vx) ? ax : ax * _chart_divide(vx, vx-bx),
-            isinf(vy) ? ay : ay * _chart_divide(vy, vy-by)
-    end
-    all(isfinite, (gx, gy, cx, cy)) || return nothing
-    B = last.head
-    gamma = S.(_block_line(x, gx, y, gy))
-    center = zero(S)
-    anchor = first(pairs)[1]
-    if length(B) > 1 && iszero(_chart_head(last, anchor)) && !iszero(B[2])
-        # Retain a complement anchored at the original selected common zero.
-        center = anchor
-        c0 = _chart_a(pairs[end], center)
-        pair = pairs[end]
-        a2 = pair[1] == pair[2] ? zero(S) : one(S)
-        dx, dy = x-center, y-center
-        a1 = pair[1] == pair[2] ? one(S) : (center-pair[1])+(center-pair[2])
-        if singleton
-            c2 = a2
-            c1 = iszero(dx) ? a1+B[2]*gx : (cx-c0)/dx-c2*dx
-        else
-            line = S.(_block_line(dx, (cx-c0)/dx, dy, (cy-c0)/dy))
-            c1, c2 = line[1], length(line) > 1 ? line[2] : zero(S)
-        end
-        complement = (S(c0), S(c1), S(c2))
-        g0, g1 = (c1-a1)/B[2], (c2-a2)/B[2]
-        gamma = S[g0-g1*center, g1]
-    else
-        # Other affine heads retain their polynomial coefficients without a remote anchor.
-        a = _factor_poly(pairs[end]...)
-        c = _padd(a, _pmul(B, gamma))
-        complement = ntuple(j -> j <= length(c) ? S(c[j]) : zero(S), 3)
-    end
-    coefficients = gamma ./ last.scale
-    reduced = (gx / last.scale, gy / last.scale)
-    all(isfinite, (center, complement..., gamma..., coefficients..., reduced...)) || return nothing
-    last.center = center
-    last.complement = complement
-    last.gamma = gamma
-    return coefficients, reduced
-end
-
 # %% _new_weight
 # Return the reduced value for the proposed datum using Classic or OneDiv.
 function _new_weight(method::Union{Classic,OneDiv}, r::QuadraticThiele, z_new, y_new)
     d = getfield(r, :data)
-    if r.chart !== nothing
-        g = last(r.chart.groups)
-        if method isa OneDiv
-            U, V = _chart_input_pair(r.chart, r.pairs, z_new, y_new, length(r.chart.groups))
-            delta = U - _chart_head(g, z_new) * V
-            a = _chart_a(last(r.pairs), z_new)
-            return isempty(g.gamma) ? _chart_divide(a * V, g.scale * delta) :
-                _chart_divide(g.scale * a * delta,
-                    _chart_complement(g, z_new) * V - _chart_gamma(g, z_new) * U)
-        end
-        if isempty(g.gamma)
-            u = _chart_input(r.chart, r.pairs, z_new, y_new, length(r.chart.groups))
-            return _chart_divide(_chart_a(last(r.pairs), z_new),
-                g.scale * (u - _chart_head(g, z_new)))
-        end
-        return g.scale * _chart_last_reduced(r.chart, r.pairs, z_new, y_new)
-    end
     d isa Thiele && return _new_weight(method, d.nodes, d.weights, z_new, y_new)
     S = promote_type(eltype(r), typeof(z_new), typeof(y_new))
     if method isa OneDiv
@@ -1341,7 +724,7 @@ function _new_weight(method::Union{Classic,OneDiv}, r::QuadraticThiele, z_new, y
         pair = d.pairs[k]
         N = _evaluate_block(d.apolys[k], pair, z_new; numerator=true)
         D = u - _evaluate_block(d.bpolys[k], pair, z_new)
-        u = iszero(D) ? convert(typeof(D), iszero(N) ? NaN : Inf) : N / D
+        u = _classic_reduced_value(N, D)
     end
     return u
 end
@@ -1349,22 +732,17 @@ end
 # %% _block_line
 # Interpolate the two reduced values by a constant or affine polynomial.
 function _block_line(z1, h1, z2, h2)
-    (!isfinite(h1) || !isfinite(h2)) && return [oftype(h1, NaN)]
-    _same(z1, z2) && return [h1]
-
     slope = (h2 - h1) / (z2 - z1)
     midpoint = (z1 + z2) / 2
     midpoint_value = (h1 + h2) / 2
-    b = [midpoint_value - slope * midpoint, slope]
-
-    return all(isfinite, b) ? b : eltype(b)[NaN]
+    return [midpoint_value - slope * midpoint, slope]
 end
 
 # %% _factor_poly
 # Return linear or quadratic numerator coefficients for the supplied node pair.
 function _factor_poly(z1, z2)
     S = promote_type(typeof(float(z1)), typeof(float(z2)))
-    singleton = _same(z1, z2)
+    singleton = z1 == z2
     z1, z2 = S(z1), S(z2)
     return singleton ? S[-z1, 1] : S[z1*z2, -(z1 + z2), 1]
 end
@@ -1375,7 +753,6 @@ end
 # `Symmetric` and `symmetric` wrap point and value maps for the adapters below.
 # `_clean_param`, `_reflection_param`, and `_mesh_params` locate nodes and build
 # the continuum mesh.
-# `_same` compares node coordinates exactly.
 # `_new_weight` reduces proposed values in both approximation methods.
 
 # %% Symmetric — wrapper type
@@ -1517,6 +894,34 @@ end
 # Compare node coordinates exactly.
 _same(z, w) = z == w
 
+# Retain the three-argument helper used by existing callers.
+_mesh_params(d, extra, ::Type{T}) where {T} = _mesh_params(d, (), extra, T)
+
+# Keep Thiele's interior sample order and skip any sample rounded to the terminal parameter.
+function _qtcf_append_interior!(active, path::DiscretizedPath, intervals=eachindex(path.next))
+    rows = size(path.params, 1)
+    terminal = length(path.path)
+    for j in 2:path.nref+1, i in intervals
+        index = (j - 1) * rows + i
+        path.params[index] < terminal && push!(active, index)
+    end
+    return active
+end
+
+# %% _qtcf_refine!
+# Insert a reflected parameter with the same interval split used by Thiele.
+function _qtcf_refine!(d::DiscretizedPath, s)
+    s = _clean_param(d.path, eltype(d.params)(s))
+    for i in eachindex(d.next)
+        successor = d.next[i]
+        left = d.params[i, 1]
+        right = successor == 0 ? length(d.path) : d.params[successor, 1]
+        (s == left || s == right) && return nothing
+        left < s < right && return _split_interval!(d, i, s)
+    end
+    throw(KeyError("Indicated new node is not in the discretization"))
+end
+
 # %% [markdown]
 # ## 6. Continuum and discrete approximation
 #
@@ -1628,9 +1033,8 @@ function _sweep!(errors, rbuf, abuf, bbuf, r::QuadraticThiele, z, y,
     resize!(rbuf, m)
     resize!(abuf, m)
     resize!(bbuf, m)
-    evaluate!(rbuf, r, z, abuf, bbuf)
+    _evaluate_thiele_samples!(rbuf, r, z, abuf, bbuf, eval_method)
     @inbounds for i in 1:m
-        isnan(rbuf[i]) && (rbuf[i] = evaluate(r, z[i], eval_method))
         errors[i] = abs(y[i] - rbuf[i])
     end
     return errors
@@ -1640,7 +1044,8 @@ end
 """
     approximate(f, curve, QTCF(); fixed_points, initial_node, float_type, tol, max_degree=100, kwargs...)
 
-Use adaptive interior samples. Startup uses the parameter midpoint unless
+Use adaptive interior samples, with the terminal parameter excluded from the
+greedy search. Startup uses the parameter midpoint unless
 initial_node is supplied. With fixed_points, use each supplied fixed point as
 one scalar block, in order, before greedy selection. Later symmetric blocks
 contain pairs by default; other fixed points are skipped.
@@ -1661,7 +1066,8 @@ function approximate(f::Function, d::ComplexCurveOrPath, ::QuadraticThiele;
     fixed_points=nothing, pairs_only::Bool=(reflection !== nothing),
     weight_method::ThieleMethod=default_weight_method(),
     eval_method::ThieleMethod=default_eval_method(), refinement::Int=3,
-    initial_refinement::Int=15, parameter_reflection::Union{Nothing,Function}=nothing)
+    initial_refinement::Int=15, parameter_reflection::Union{Nothing,Function}=nothing,
+    comparison_scale=nothing)
     refinement >= 1 || throw(ArgumentError("refinement must be positive"))
     max_iter >= 1 || throw(ArgumentError("max_iter must be positive"))
     pairs_only && reflection === nothing && throw(ArgumentError("pairs_only requires a reflection map"))
@@ -1709,10 +1115,12 @@ function approximate(f::Function, d::ComplexCurveOrPath, ::QuadraticThiele;
     history = IterationRecord[IterationRecord(r, NaN, missing)]
     reason, best = :max_degree, 1
 
+    terminal = length(d)
     while true
         empty!(active)
         for j in 2:num_ref+1, i in 1:length(path.next)
             index = (j - 1) * rows + i
+            0 < path.params[index] < terminal || continue
             sample = τ[index]
             (sample + zero(sample)) in selected_nodes || push!(active, index)
         end
@@ -1727,7 +1135,8 @@ function approximate(f::Function, d::ComplexCurveOrPath, ::QuadraticThiele;
         fmax = max(fmax, maximum(abs, ytest))
         forced = fixed !== nothing && next_fixed <= length(fixed)
         eligible = pairs_only ?
-            [k for k in eachindex(active) if τ[active[k]] != reflection(τ[active[k]])] :
+            [k for k in eachindex(active) if _eligible_thiele_pair(τ[active[k]],
+                reflection(τ[active[k]]), selected_nodes)] :
             collect(eachindex(active))
         if forced
             if length(history) >= max_iter
@@ -1738,7 +1147,7 @@ function approximate(f::Function, d::ComplexCurveOrPath, ::QuadraticThiele;
             w = fixed[next_fixed] + zero(z)
             block = _qtcf_block(sampler, s, w, f(w), reflection, value_reflection)
         else
-            reason, best = quitting_check(history, stagnation, tol, fmax, max_iter, policy)
+            reason, best = quitting_check(history, stagnation, tol, something(comparison_scale, fmax), max_iter, policy)
             reason === :iterating || break
             if isempty(eligible)
                 reason, best = :exhausted, best_acceptable(history, policy)
@@ -1804,8 +1213,9 @@ initial_node. With fixed_points, use each supplied fixed point as one scalar
 block, in order. Later symmetric blocks contain pairs by default; other fixed
 points are skipped. All startup points and partners must be present in the grid.
 Input data determine storage; float_type sets the default tolerance.
-The check set includes selected nodes. Every completed block is recorded;
-return the lowest-error admissible record. Budgets count blocks.
+The check set includes selected nodes. Every completed block is recorded.
+Return the current approximant on convergence, otherwise the lowest-error
+admissible record. Budgets count blocks.
 """
 function approximate(y::AbstractVector{T}, z::AbstractVector{Z}, ::QuadraticThiele;
     float_type::Type{<:AbstractFloat}=_qtcf_float_type(z),
@@ -1891,7 +1301,6 @@ function approximate(y::AbstractVector{T}, z::AbstractVector{Z}, ::QuadraticThie
         push!(history, IterationRecord(r, NaN, missing))
         filter!(i -> i ∉ block.ids, sampler.remaining)
     end
-    best = best_acceptable(history, policy)
     r = copy(history[best].interpolant)
     stop = ConvergenceStatus(reason, best, history)
     return DiscreteApproximation(y, z, r, _remaining_mask(r, z), policy, history, stop)
@@ -1974,16 +1383,8 @@ function Base.:+(r::QuadraticThiele, s::Number)
     S = promote_type(eltype(r), typeof(s))
     b = [S.(p) for p in d.bpolys]
     b[1][1] += s
-    chart = _convert_chart(S, r.chart)
-    if chart !== nothing
-        g = first(chart.groups)
-        g.head[1] += s
-        gamma1 = length(g.gamma) > 1 ? g.gamma[2] : zero(S)
-        g.complement = (g.complement[1] + s*_chart_gamma(g, g.center),
-            g.complement[2] + s*gamma1, g.complement[3])
-    end
     return _qtcf_from_blocks(Tuple{S,S}.(d.pairs), b,
-        [S.(p) for p in d.apolys], S.(d.nodes), S.(d.vals .+ s), chart)
+        [S.(p) for p in d.apolys], S.(d.nodes), S.(d.vals .+ s))
 end
 
 # %% Base.:-
@@ -2004,16 +1405,6 @@ function Base.:*(r::QuadraticThiele, s::Number)
     end
 
     b = [isodd(j) ? s .* S.(p) : S.(p) ./ s for (j, p) in enumerate(d.bpolys)]
-    chart = _convert_chart(S, r.chart)
-    if chart !== nothing
-        g = first(chart.groups)
-        g.head .*= s
-        g.gamma ./= s
-        g.ratio *= s
-        for g in Iterators.drop(chart.groups, 1)
-            g.scale *= s
-        end
-    end
     return _qtcf_from_blocks(Tuple{S,S}.(d.pairs), b,
-        [S.(p) for p in d.apolys], S.(d.nodes), S.(s .* d.vals), chart)
+        [S.(p) for p in d.apolys], S.(d.nodes), S.(s .* d.vals))
 end

@@ -36,6 +36,8 @@ Why an approximation iteration stopped, and which iterate it returned.
 - `:max_degree`: the degree budget was exhausted before reaching `tol`
 - `:node_failure`: a new node could not be added
 - `:nan_weight`: a NaN weight was encountered
+- `:nonfinite_weight`: one leg of a paired scalar update had a nonfinite weight
+- `:nonfinite_target`: a proposed scalar pair had nonfinite target data
 - `:refinement`: the path refinement limit was exceeded
 - `:exhausted`: all available sample values were used
 - `:rewound`: the iterate was selected by [`rewind`](@ref), not by the iteration
